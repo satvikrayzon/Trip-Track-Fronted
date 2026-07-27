@@ -1,0 +1,48 @@
+/// REST paths — align with your NestJS global prefix (e.g. `/api/v1`).
+/// Set base URL only in [ApiEnv]; paths here are relative to that root.
+abstract final class ApiEndpoints {
+  static const String authLogin = '/auth/login';
+  static const String authRefresh = '/auth/refresh';
+  static const String authForgotPassword = '/auth/forgot-password';
+  static const String authMe = '/auth/me';
+
+  static const String users = '/users';
+  static const String reportingManagers = '/users/reporting-managers';
+  static String user(String id) => '$users/$id';
+  static String userDeactivate(String id) => '$users/$id/deactivate';
+  static String userActivate(String id) => '$users/$id/activate';
+
+  static const String travelRequests = '/travel-requests';
+  static const String travelRequestsActive = '$travelRequests/active';
+  static const String travelRequestsSummary = '$travelRequests/summary';
+  static String travelRequest(String id) => '$travelRequests/$id';
+  static String travelRequestDeparture(String requestId) =>
+      '$travelRequests/$requestId/departure';
+  static String travelRequestArrival(String requestId) =>
+      '$travelRequests/$requestId/arrival';
+  static String travelRequestMeetingStart(String requestId) =>
+      '$travelRequests/$requestId/meeting-start';
+  static String travelRequestMeetingEnd(String requestId) =>
+      '$travelRequests/$requestId/meeting-end';
+  static String travelRequestReturnStart(String requestId) =>
+      '$travelRequests/$requestId/return-start';
+  static String travelRequestNextClient(String requestId) =>
+      '$travelRequests/$requestId/next-client';
+  /// Fallback when travel-request punch proxies are not deployed yet.
+  static String tripMeetingStart(String tripId) =>
+      '/trips/$tripId/punches/meeting-start';
+  static String tripMeetingEnd(String tripId) =>
+      '/trips/$tripId/punches/meeting-end';
+  static String travelRequestRoutePoints(String requestId) =>
+      '$travelRequests/$requestId/route-points';
+  static String travelRequestRoutePointsBatch(String requestId) =>
+      '$travelRequests/$requestId/route-points/batch';
+  static String travelRequestTrackingEventsBatch(String requestId) =>
+      '$travelRequests/$requestId/tracking-events/batch';
+  static String travelRequestTrackingCoverage(String requestId) =>
+      '$travelRequests/$requestId/tracking-coverage';
+  static String travelRequestMeterImage(String requestId) =>
+      '$travelRequests/$requestId/meter-image';
+
+  static const String adminFuelRates = '/admin/fuel-rates';
+}
