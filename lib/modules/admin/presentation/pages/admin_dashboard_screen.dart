@@ -780,7 +780,7 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
             final card = TravelRequestCard(
               name: request.displayUserName,
               employeeCode: request.employeeCode,
-              showDeleteButton: canDeleteTravelRequest(request),
+              showDeleteButton: canDeleteTravelRequest(request, asAdmin: true),
               isDeleteLoading: isDeleting,
               clientName: request.clientName.isNotEmpty
                   ? request.clientName
@@ -832,18 +832,6 @@ class _AdminDashboardScreenState extends State<AdminDashboardScreen> {
   }
 
   void _handleDeleteRequest(TravelRequestModel request) {
-    if (!canDeleteTravelRequest(request)) {
-      final message = request.status == 'Completed'
-          ? 'Cannot delete completed request'
-          : 'Cannot delete — trip has already started';
-      showAppSnackBar(
-        title: 'Cannot Delete',
-        message: message,
-        backgroundColor: Colors.orange,
-      );
-      return;
-    }
-
     unawaited(_confirmDeleteRequest(request));
   }
 

@@ -9,6 +9,7 @@ import '../../../../core/network/failures/network_failure.dart';
 import '../../../../core/network/models/api_result.dart';
 import '../../../../core/utils/travel_request_debug_log.dart';
 import '../../../../core/utils/app_debug_log.dart';
+import '../models/route_segment_model.dart';
 import '../models/tracking_coverage_model.dart';
 import '../models/travel_request_list_result.dart';
 import '../models/travel_request_summary.dart';
@@ -553,6 +554,70 @@ class TravelRequestRemoteDataSource {
       }
       return TrackingCoverageResult.fromMap(
         Map<String, dynamic>.from(data),
+      );
+    });
+  }
+
+  /// Official matched route — `GET /travel-requests/:id/matched-route`.
+  Future<ApiResult<MatchedRouteResult>> getMatchedRoute(String requestId) {
+    return runApi(() async {
+      final response = await _dio.get(
+        ApiEndpoints.travelRequestMatchedRoute(requestId),
+        options: dioTimeoutOptions(const Duration(seconds: 10)),
+      );
+      final data = response.data;
+      if (data is! Map) {
+        throw const FormatException('Matched route response is not a map');
+      }
+      final root = Map<String, dynamic>.from(data);
+      final nested = root['data'] ?? root['matchedRoute'] ?? root;
+      if (nested is! Map) {
+        throw const FormatException('Matched route payload missing');
+      }
+      final parsed = MatchedRouteResult.fromMap(Map<String, dynamic>.from(nested));
+      if (parsed.requestId.isEmpty) {
+        return MatchedRouteResult.fromMap({
+          ...Map<String, dynamic>.from(nested),
+          'requestId': requestId,
+        });
+      }
+      return parsed;
+    });
+  }
+
+  /// Enqueue map match — `POST /travel-requests/:id/match`.
+  ///
+  /// [reason]: `catch_up` | `trip_end` | `incremental` | `manual`
+  Future<ApiResult<MatchedRouteResult>> triggerRouteMatch(
+    String requestId, {
+    String reason = 'catch_up',
+  }) {
+    return runApi(() async {
+      final response = await _dio.post(
+        ApiEndpoints.travelRequestMatch(requestId),
+        data: {'reason': reason},
+        options: dioTimeoutOptions(const Duration(seconds: 15)),
+      );
+      final data = response.data;
+      if (data is Map) {
+        final root = Map<String, dynamic>.from(data);
+        final nested = root['data'] ?? root['matchedRoute'] ?? root;
+        if (nested is Map) {
+          final parsed =
+              MatchedRouteResult.fromMap(Map<String, dynamic>.from(nested));
+          if (parsed.requestId.isEmpty) {
+            return MatchedRouteResult.fromMap({
+              ...Map<String, dynamic>.from(nested),
+              'requestId': requestId,
+              'status': root['status'] ?? parsed.status,
+            });
+          }
+          return parsed;
+        }
+      }
+      return MatchedRouteResult(
+        requestId: requestId,
+        status: 'pending',
       );
     });
   }

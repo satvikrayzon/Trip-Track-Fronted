@@ -7,6 +7,8 @@ import 'package:uuid/uuid.dart';
 
 import '../constants/app_constants.dart';
 import '../database/hive_database.dart';
+import '../filter/kalman_filter_2d.dart';
+import '../utils/gps_jump_gate.dart';
 import '../../modules/travel/data/models/route_point_model.dart';
 import '../di/service_locator.dart';
 import '../../features/tracking/data/services/websocket_tracking_service.dart';
@@ -32,6 +34,8 @@ class BackgroundLocationService {
   String? _sessionId;
   TrackingPace _pace = TrackingPace.traveling;
 
+  final KalmanFilter2D _kalmanFilter = KalmanFilter2D();
+
   loc.LocationData? _lastAccepted;
   DateTime? _lastEmitTime;
   final ValueNotifier<int> pointsBuffered = ValueNotifier<int>(0);
@@ -53,7 +57,7 @@ class BackgroundLocationService {
     return last;
   }
 
-  static const double _maxAccuracyM = 100;
+  static const double _maxAccuracyM = 80;
   static const double _minRepeatM = 3;
   static const int _minRepeatMs = 2500;
 
@@ -71,10 +75,23 @@ class BackgroundLocationService {
       return;
     }
 
+    final sessionChanged =
+        _requestId != requestId || _sessionId != sessionId;
+    if (sessionChanged) {
+      _kalmanFilter.reset();
+      _lastAccepted = null;
+      _lastEmitTime = null;
+    }
+
     _requestId = requestId;
     _legId = legId;
     _sessionId = sessionId;
     _pace = pace;
+
+    // Seed last accepted from Hive so post-kill resume rejects teleports.
+    if (_lastAccepted == null) {
+      await _seedLastAcceptedFromHive(requestId);
+    }
 
     await _applySettings(_pace);
     try {
@@ -83,6 +100,7 @@ class BackgroundLocationService {
         // Still track in foreground; background may be denied on some devices.
       }
     } catch (e) {
+      debugPrint('Background location mode enable failed: $e');
     }
 
     if (ServiceLocator.I.has<WebSocketTrackingService>()) {
@@ -127,6 +145,7 @@ class BackgroundLocationService {
   Future<void> stopAll() async {
     await _subscription?.cancel();
     _subscription = null;
+    _kalmanFilter.reset();
     // On some devices this never completes and blocks the UI thread of punch flow.
     try {
       await _location
@@ -151,6 +170,40 @@ class BackgroundLocationService {
     );
   }
 
+  Future<void> _seedLastAcceptedFromHive(String requestId) async {
+    try {
+      final rows =
+          await HiveDatabase.instance.getRoutePointsForRequest(requestId);
+      if (rows.isEmpty) return;
+      // Walk from newest for a valid non-teleport seed.
+      for (var i = rows.length - 1; i >= 0; i--) {
+        final lat = (rows[i]['latitude'] as num?)?.toDouble();
+        final lng = (rows[i]['longitude'] as num?)?.toDouble();
+        final acc = (rows[i]['accuracy'] as num?)?.toDouble() ?? 30;
+        if (lat == null || lng == null) continue;
+        final decision = GpsJumpGate.evaluate(
+          lat: lat,
+          lng: lng,
+          accuracyM: acc,
+          timestamp: DateTime.now(),
+        );
+        if (!decision.accepted) continue;
+        final ts = DateTime.tryParse(rows[i]['timestamp']?.toString() ?? '');
+        _lastAccepted = loc.LocationData.fromMap({
+          'latitude': lat,
+          'longitude': lng,
+          'accuracy': acc,
+          'speed': (rows[i]['speed'] as num?)?.toDouble() ?? 0,
+          'heading': (rows[i]['heading'] as num?)?.toDouble() ?? 0,
+        });
+        _lastEmitTime = ts ?? DateTime.now();
+        return;
+      }
+    } catch (e) {
+      debugPrint('seedLastAcceptedFromHive failed: $e');
+    }
+  }
+
   Future<void> _onLocation(loc.LocationData data) async {
     if (_requestId == null || _legId == null || _sessionId == null) return;
     if (!AppConstants.featureLiveGpsTracking) return;
@@ -159,11 +212,74 @@ class BackgroundLocationService {
     final lng = data.longitude;
     if (lat == null || lng == null) return;
 
-    final acc = data.accuracy;
-    if (acc != null && acc > _maxAccuracyM) return;
+    final acc = data.accuracy ?? 10.0;
+    if (acc > _maxAccuracyM) return;
 
     final now = DateTime.now();
+    final rawSpeed = data.speed;
+
+    // Reject teleports / indoor drift BEFORE Kalman so filter state stays clean.
     final last = _lastAccepted;
+    final gate = GpsJumpGate.evaluate(
+      lat: lat,
+      lng: lng,
+      accuracyM: acc,
+      timestamp: now,
+      speedMps: rawSpeed,
+      prevLat: last?.latitude,
+      prevLng: last?.longitude,
+      prevTimestamp: _lastEmitTime,
+    );
+    if (!gate.accepted) {
+      // Hard teleport: reset Kalman so next good fix isn't pulled toward junk.
+      if (gate.reason == 'hard_jump' || gate.reason == 'impossible_speed') {
+        _kalmanFilter.reset();
+      }
+      debugPrint('GPS rejected: ${gate.reason}');
+      return;
+    }
+
+    // Apply 2D Extended Kalman Filter to raw coordinates
+    final filteredResult = _kalmanFilter.process(
+      latitude: lat,
+      longitude: lng,
+      timestamp: now,
+      accuracy: acc,
+    );
+
+    final filteredLat = filteredResult['latitude']!;
+    final filteredLng = filteredResult['longitude']!;
+    final estimatedSpeed = filteredResult['speedMps'] ?? data.speed ?? 0.0;
+
+    // Re-check filtered coords against last accepted (Kalman can lag toward jump).
+    final postGate = GpsJumpGate.evaluate(
+      lat: filteredLat,
+      lng: filteredLng,
+      accuracyM: acc,
+      timestamp: now,
+      speedMps: estimatedSpeed,
+      prevLat: last?.latitude,
+      prevLng: last?.longitude,
+      prevTimestamp: _lastEmitTime,
+    );
+    if (!postGate.accepted) {
+      _kalmanFilter.reset();
+      debugPrint('GPS filtered rejected: ${postGate.reason}');
+      return;
+    }
+
+    final filteredData = loc.LocationData.fromMap({
+      'latitude': filteredLat,
+      'longitude': filteredLng,
+      'accuracy': acc,
+      'altitude': data.altitude,
+      'speed': estimatedSpeed,
+      'speed_accuracy': data.speedAccuracy,
+      'heading': data.heading,
+      'time': data.time,
+      'isMock': data.isMock,
+    });
+
     if (last != null && last.latitude != null && last.longitude != null) {
       final lastEmit = _lastEmitTime ?? now;
       final dt = now.difference(lastEmit);
@@ -171,24 +287,35 @@ class BackgroundLocationService {
         final d = _haversineM(
           last.latitude!,
           last.longitude!,
-          lat,
-          lng,
+          filteredLat,
+          filteredLng,
         );
         if (d < _minRepeatM) return;
       }
+      // Paused / indoor: require larger movement before storing.
+      if (_pace == TrackingPace.paused &&
+          _haversineM(
+                last.latitude!,
+                last.longitude!,
+                filteredLat,
+                filteredLng,
+              ) <
+              20) {
+        return;
+      }
     }
 
-    final speed = data.speed;
+    final speed = filteredData.speed;
     final moving = speed == null
         ? true
         : speed.abs() > 0.4 || _pace == TrackingPace.traveling;
 
     final synced = await _persistPoint(
-      data,
+      filteredData,
       isMoving: moving,
       isStopMarker: false,
     );
-    _lastAccepted = data;
+    _lastAccepted = filteredData;
     _lastEmitTime = now;
 
     // Opportunistic sync when online (non-blocking) and not synced via WS.

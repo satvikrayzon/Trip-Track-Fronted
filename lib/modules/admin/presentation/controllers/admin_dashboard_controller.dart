@@ -323,8 +323,8 @@ class AdminDashboardController {
     );
 
     if (index != -1) {
-
-      list[index] = updatedRequest;
+      final oldRequest = list[index];
+      list[index] = updatedRequest.mergePreservingLocalProgress(oldRequest);
 
       recentRequests.value = list;
 

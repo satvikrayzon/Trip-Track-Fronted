@@ -7,6 +7,7 @@ import '../../../../core/di/service_locator.dart';
 import '../../../../core/network/failures/network_failure.dart';
 import '../../../../core/network/models/api_result.dart';
 import '../../../../core/utils/app_debug_log.dart';
+import '../../../../features/tracking/data/services/trip_realtime_binder.dart';
 import '../../../auth/presentation/controllers/app_auth_controller.dart';
 import '../../../travel/data/datasources/travel_request_remote_datasource.dart';
 import '../../../travel/data/models/travel_request_model.dart';
@@ -38,18 +39,59 @@ class UserRequestsController {
   List<TravelRequestModel> _allMine = [];
   String _searchQuery = '';
   int _page = 1;
+  TripRealtimeBinder? _tripRealtime;
 
   void start() {
     unawaited(loadRequests());
+    _tripRealtime = TripRealtimeBinder(
+      onTripUpdate: applyTripUpdate,
+      onTripDelete: deleteTripLocally,
+    )..start();
   }
 
   void dispose() {
+    _tripRealtime?.dispose();
+    _tripRealtime = null;
     isLoading.dispose();
     isLoadingMore.dispose();
     hasMore.dispose();
     requests.dispose();
     filterStatus.dispose();
     deletingRequestId.dispose();
+  }
+
+  void applyTripUpdate(TravelRequestModel updatedRequest) {
+    final userId = _authController.currentUserApiId;
+    if (userId != null &&
+        userId.isNotEmpty &&
+        updatedRequest.userId.isNotEmpty &&
+        updatedRequest.userId != userId) {
+      return;
+    }
+
+    final index = _allMine.indexWhere(
+      (r) =>
+          tripMatchesRealtimeKey(r, updatedRequest.requestId) ||
+          tripMatchesRealtimeKey(r, updatedRequest.restResourceId) ||
+          (updatedRequest.tripId.isNotEmpty &&
+              tripMatchesRealtimeKey(r, updatedRequest.tripId)),
+    );
+    if (index == -1) {
+      _allMine.insert(0, updatedRequest.ensureTripLegs());
+      _allMine.sort((a, b) => b.requestDate.compareTo(a.requestDate));
+    } else {
+      final old = _allMine[index];
+      _allMine[index] =
+          updatedRequest.mergePreservingLocalProgress(old).ensureTripLegs();
+    }
+    _applyFilters();
+  }
+
+  void deleteTripLocally(String id) {
+    _allMine.removeWhere(
+      (r) => r.requestId == id || r.restResourceId == id || r.tripId == id,
+    );
+    _applyFilters();
   }
 
   Future<void> loadRequests({bool reset = true}) async {
@@ -81,15 +123,41 @@ class UserRequestsController {
           }).toList();
 
           if (reset) {
-            _allMine = pageItems;
-            if (pageItems.isNotEmpty) {
-              await _syncHiveWithServer(userId, pageItems);
+            final previousById = <String, TravelRequestModel>{
+              for (final r in _allMine)
+                if (r.requestId.isNotEmpty) r.requestId: r,
+            };
+            _allMine = pageItems.map((item) {
+              final prev = previousById[item.requestId];
+              if (prev == null) return item;
+              return item.mergePreservingLocalProgress(prev).ensureTripLegs();
+            }).toList();
+            if (_allMine.isNotEmpty) {
+              await _syncHiveWithServer(userId, _allMine);
             }
           } else {
             final seen = _allMine.map((r) => r.requestId).toSet();
-            _allMine.addAll(
-              pageItems.where((r) => !seen.contains(r.requestId)),
-            );
+            final previousById = <String, TravelRequestModel>{
+              for (final r in _allMine)
+                if (r.requestId.isNotEmpty) r.requestId: r,
+            };
+            for (final item in pageItems) {
+              if (seen.contains(item.requestId)) {
+                final idx =
+                    _allMine.indexWhere((r) => r.requestId == item.requestId);
+                if (idx != -1) {
+                  _allMine[idx] =
+                      item.mergePreservingLocalProgress(_allMine[idx]);
+                }
+                continue;
+              }
+              final prev = previousById[item.requestId];
+              _allMine.add(
+                prev == null
+                    ? item
+                    : item.mergePreservingLocalProgress(prev),
+              );
+            }
           }
 
           _allMine.sort((a, b) => b.requestDate.compareTo(a.requestDate));

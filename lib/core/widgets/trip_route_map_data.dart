@@ -4,12 +4,14 @@ import 'package:flutter/foundation.dart';
 import '../database/hive_database.dart';
 import '../utils/route_point_simplify.dart';
 import '../utils/trip_route_polyline_decode.dart';
+import '../../modules/travel/data/models/route_segment_model.dart';
 import '../../modules/travel/data/models/travel_request_model.dart';
 import '../di/service_locator.dart';
 import '../network/models/api_result.dart';
 import '../../modules/travel/data/datasources/travel_request_remote_datasource.dart';
 import '../utils/geo_utils.dart';
 import '../services/distance_service.dart';
+import '../services/map_matching_service.dart';
 import '../config/google_maps_config.dart';
 
 final Map<String, List<LatLng>> _routePointsMemCache = {};
@@ -178,12 +180,14 @@ Future<List<List<LatLng>>> loadTraveledLegPoints(TravelRequestModel request) asy
 
           if (prev.time != null && next.time != null) {
             final timeDiff = next.time!.difference(prev.time!);
-            if (timeDiff > const Duration(minutes: 5) && GoogleMapsConfig.isConfigured) {
+            // Never Directions-fill teleports — invents ocean/highway km.
+            if (timeDiff > const Duration(minutes: 5) &&
+                GoogleMapsConfig.isConfigured) {
               final directDist = GeoUtils.distanceMeters(
                 prev.lat, prev.lng,
                 next.lat, next.lng,
               );
-              if (directDist > 150) {
+              if (directDist > 150 && directDist <= 2500) {
                 try {
                   final routes = await distanceService.fetchDrivingRoutesWithAlternatives(
                     originLatitude: prev.lat,
@@ -229,6 +233,42 @@ Future<List<List<LatLng>>> loadTraveledLegPoints(TravelRequestModel request) asy
   return legPaths;
 }
 
+/// Official Layer B segments from Nest match cache / API.
+Future<List<RouteSegmentModel>> loadMatchedRouteSegments(
+  TravelRequestModel request,
+) async {
+  final id = request.restResourceId.isNotEmpty
+      ? request.restResourceId
+      : request.requestId;
+  if (id.isEmpty) return const [];
+
+  if (ServiceLocator.I.has<MapMatchingService>()) {
+    final fromService = await ServiceLocator.I
+        .get<MapMatchingService>()
+        .loadSegmentsForRequest(id);
+    if (fromService.isNotEmpty) return fromService;
+  }
+
+  // Fallback: synthesize segments from per-leg matched polylines.
+  final synthesized = <RouteSegmentModel>[];
+  for (final leg in request.tripLegs) {
+    final poly = leg.matchedRoutePolylineEncoded;
+    if (poly == null || poly.isEmpty) continue;
+    synthesized.add(
+      RouteSegmentModel(
+        segId: '${leg.legId}_matched',
+        legId: leg.legId,
+        kind: RouteSegmentKind.mapMatched,
+        confidence: leg.matchConfidence ?? 0.7,
+        lengthM: ((leg.officialDistanceKm ?? 0) * 1000),
+        polylineEncoded: poly,
+        matchMethod: 'leg_polyline',
+      ),
+    );
+  }
+  return synthesized;
+}
+
 /// Clears in-memory route cache after a fresh server fetch.
 void cacheServerRoutePoints(String requestId, List<LatLng> points) {
   if (requestId.isEmpty || points.isEmpty) return;
@@ -244,7 +284,7 @@ void evictRoutePointsCache(String id) {
 
 /// Display-ready path (decimated for map performance).
 List<LatLng> mapDisplayRoutePoints(List<LatLng> points) =>
-    simplifyRoutePointsForMap(points);
+    simplifyRoutePointsForMap(stripTeleportSpikesForMap(points));
 
 /// Best-effort start point for map initial camera (from coordinates or punches).
 LatLng? tripMapStartTarget(TravelRequestModel r) {

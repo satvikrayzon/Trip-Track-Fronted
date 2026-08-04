@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/widgets.dart';
 
 import '../di/service_locator.dart';
+import 'punch_reminder_service.dart';
 import 'tracking_event_service.dart';
 
 /// Forwards app lifecycle to [TrackingEventService] during active trips.
@@ -29,18 +30,24 @@ class TrackingLifecycleBinder extends WidgetsBindingObserver {
           ? ServiceLocator.I.get<TrackingEventService>()
           : null;
 
+  PunchReminderService? get _reminders =>
+      ServiceLocator.I.has<PunchReminderService>()
+          ? ServiceLocator.I.get<PunchReminderService>()
+          : null;
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     final events = _events;
-    if (events == null) return;
 
     switch (state) {
       case AppLifecycleState.paused:
       case AppLifecycleState.detached:
       case AppLifecycleState.hidden:
-        unawaited(events.onAppBackground());
+        if (events != null) unawaited(events.onAppBackground());
       case AppLifecycleState.resumed:
-        unawaited(events.onAppForeground());
+        if (events != null) unawaited(events.onAppForeground());
+        final reminders = _reminders;
+        if (reminders != null) unawaited(reminders.checkNow());
       case AppLifecycleState.inactive:
         break;
     }

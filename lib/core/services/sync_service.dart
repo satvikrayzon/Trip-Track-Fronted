@@ -5,11 +5,13 @@ import 'package:flutter/foundation.dart';
 import '../constants/app_constants.dart';
 import '../database/hive_database.dart';
 import '../di/api_registrar.dart';
+import '../di/service_locator.dart';
 import '../network/models/api_result.dart';
 import '../../modules/travel/data/datasources/travel_request_remote_datasource.dart';
 import '../../modules/travel/data/models/route_point_model.dart';
 import '../../modules/travel/data/models/tracking_event_model.dart';
 import 'connectivity_service.dart';
+import 'map_matching_service.dart';
 
 /// Offline-to-online sync (REST + Hive).
 class SyncService {
@@ -209,10 +211,12 @@ class SyncService {
       }
 
       final syncedIds = <String>[];
+      final matchedRequestIds = <String>{};
       var anyFailure = false;
       for (final entry in byRequest.entries) {
         final result = await api.postRoutePointsBatch(entry.key, entry.value);
         if (result.isSuccess) {
+          matchedRequestIds.add(entry.key);
           for (final p in entry.value) {
             final id = p['pointId'] as String?;
             if (id != null) syncedIds.add(id);
@@ -225,6 +229,13 @@ class SyncService {
       if (syncedIds.isNotEmpty) {
         await _db.markRoutePointsSynced(syncedIds);
         await _updatePendingCount();
+        // After offline catch-up, ask Nest to rematch official route/km.
+        if (ServiceLocator.I.has<MapMatchingService>()) {
+          final matcher = ServiceLocator.I.get<MapMatchingService>();
+          for (final requestId in matchedRequestIds) {
+            unawaited(matcher.triggerMatch(requestId, reason: 'catch_up'));
+          }
+        }
       }
 
       if (anyFailure || syncedIds.isEmpty) {

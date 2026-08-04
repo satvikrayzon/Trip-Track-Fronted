@@ -162,6 +162,21 @@ class AppConstants {
   /// Arrival punch: max distance from [toLocation] coordinates (meters).
   static const double arrivalGeofenceRadiusMeters = 500;
 
+  /// Warn while still inside the geofence but nearing the edge (meters).
+  static const double punchReminderEdgeMeters = 350;
+
+  /// How often the punch-reminder monitor samples location.
+  static const Duration punchReminderPollInterval = Duration(seconds: 40);
+
+  /// Minimum dwell inside destination before arrival nudge.
+  static const Duration punchReminderArrivalDwell = Duration(minutes: 2);
+
+  /// Cooldown between identical punch reminder notifications.
+  static const Duration punchReminderNotifyCooldown = Duration(minutes: 4);
+
+  /// Shorter cooldown when user is about to leave / already left the zone.
+  static const Duration punchReminderUrgentCooldown = Duration(minutes: 2);
+
   /// Reject GPS fixes worse than this accuracy (meters).
   static const double punchMaxAccuracyMeters = 100;
 

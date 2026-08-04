@@ -189,7 +189,7 @@ class _AdminTravelRequestsScreenState extends State<AdminTravelRequestsScreen> {
                         name: request.displayUserName,
                         employeeCode: request.employeeCode,
                         isAdmin: true,
-                        showDeleteButton: canDeleteTravelRequest(request),
+                        showDeleteButton: canDeleteTravelRequest(request, asAdmin: true),
                         isDeleteLoading: isDeleting,
                         clientName: request.clientName.isNotEmpty
                             ? request.clientName
@@ -209,9 +209,12 @@ class _AdminTravelRequestsScreenState extends State<AdminTravelRequestsScreen> {
                         isSynced: true,
                         startImageUrl: request.startImageUrl,
                         endImageUrl: request.endImageUrl,
-                        onTap: () => AppNavigation.to(
-                            AppRoutes.userRequestDetails,
-                            arguments: request),
+                        onTap: () => unawaited(
+                              AppNavigation.to(
+                                AppRoutes.userRequestDetails,
+                                arguments: request,
+                              ).then((_) => _controller.refresh()),
+                            ),
                         onDelete: () => _handleDeleteRequest(request));
                   },
                 ),
@@ -315,17 +318,6 @@ class _AdminTravelRequestsScreenState extends State<AdminTravelRequestsScreen> {
   }
 
   void _handleDeleteRequest(TravelRequestModel request) {
-    if (!canDeleteTravelRequest(request)) {
-      final message = request.status == 'Completed'
-          ? 'Cannot delete completed request'
-          : 'Cannot delete — trip has already started';
-      showAppSnackBar(
-        title: 'Cannot Delete',
-        message: message,
-        backgroundColor: AppColors.warning,
-      );
-      return;
-    }
     unawaited(_confirmDeleteRequest(request));
   }
 

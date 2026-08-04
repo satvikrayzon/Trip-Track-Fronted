@@ -44,5 +44,13 @@ abstract final class ApiEndpoints {
   static String travelRequestMeterImage(String requestId) =>
       '$travelRequests/$requestId/meter-image';
 
+  /// Official map-matched route + km (Nest MapMatchingWorker).
+  static String travelRequestMatchedRoute(String requestId) =>
+      '$travelRequests/$requestId/matched-route';
+
+  /// Enqueue rematch after GPS catch-up / trip end.
+  static String travelRequestMatch(String requestId) =>
+      '$travelRequests/$requestId/match';
+
   static const String adminFuelRates = '/admin/fuel-rates';
 }

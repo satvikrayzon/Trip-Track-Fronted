@@ -301,9 +301,11 @@ class _UserRequestListScreenState extends State<UserRequestListScreen> {
                       showEditButton: canEditTravelRequest(request),
                       showDeleteButton: canDeleteTravelRequest(request),
                       isDeleteLoading: isDeleting,
-                      onTap: () => AppNavigation.to(
-                        AppRoutes.userRequestDetails,
-                        arguments: request,
+                      onTap: () => unawaited(
+                        AppNavigation.to(
+                          AppRoutes.userRequestDetails,
+                          arguments: request,
+                        ).then((_) => _controller.refresh()),
                       ),
                       onEdit: () => _handleEditRequest(request),
                       onDelete: () => _handleDeleteRequest(request),

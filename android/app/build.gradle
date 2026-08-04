@@ -32,6 +32,10 @@ android {
         targetSdk = 35
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        ndk {
+            // Physical devices only — skips broken host x86_64 CMake configure.
+            abiFilters 'armeabi-v7a', 'arm64-v8a'
+        }
     }
 
     signingConfigs {

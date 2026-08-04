@@ -19,6 +19,9 @@ import 'trip_route_fullscreen_map_screen.dart';
 import 'trip_route_map_data.dart';
 import '../services/background_location_service.dart';
 import '../di/service_locator.dart';
+import '../utils/distance_sanity.dart';
+import '../utils/geo_utils.dart';
+import '../../modules/travel/data/models/route_segment_model.dart';
 
 /// Zomato / Swiggy / Uber style trip detail: full-screen map + draggable sheet.
 class TripDetailMapLayout extends StatefulWidget {
@@ -60,6 +63,8 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   Future<List<List<LatLng>>>? _routePointsFuture;
   String _routePointsCacheKey = '';
   List<List<LatLng>>? _resolvedPoints;
+  List<RouteSegmentModel> _matchedSegments = const [];
+  String _matchedCacheKey = '';
   BackgroundLocationService? _bgLocationService;
 
   late AnimationController _livePulse;
@@ -114,9 +119,14 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
 
   bool get _hasActionButton => widget.sheetFooter != null;
 
-  String _routeDataKey(TravelRequestModel r) =>
-      '${r.requestId}|${r.routePointCount}|${r.status}|'
-      '${r.tripLegs.map((e) => '${e.legId}:${e.departurePunch?.time}:${e.arrivalPunch?.time}').join(';')}';
+  String _routeDataKey(TravelRequestModel r) {
+    final last = r.routePoints.isNotEmpty ? r.routePoints.last : null;
+    final lastSig = last == null
+        ? '0'
+        : '${last['latitude']}|${last['longitude']}|${r.routePoints.length}';
+    return '${r.requestId}|${r.routePointCount}|${r.routePoints.length}|$lastSig|${r.status}|'
+        '${r.tripLegs.map((e) => '${e.legId}:${e.departurePunch?.time}:${e.arrivalPunch?.time}:${e.officialDistanceKm}:${e.matchedRoutePolylineEncoded?.length ?? 0}').join(';')}';
+  }
 
   String _adminServerKey(List<LatLng>? p) {
     if (p == null) return 'n';
@@ -157,6 +167,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       _bgLocationService?.pointsBuffered.addListener(_onLocalPointsUpdated);
     }
     _syncRouteLoad();
+    _syncMatchedLoad();
   }
 
   void _onLocalPointsUpdated() {
@@ -200,6 +211,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   void didUpdateWidget(TripDetailMapLayout oldWidget) {
     super.didUpdateWidget(oldWidget);
     _syncRouteLoad();
+    _syncMatchedLoad();
     if (oldWidget.request.requestId != widget.request.requestId) {
       _releaseMapController();
       _lastCameraTarget = null;
@@ -232,6 +244,17 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       setState(() => _resolvedPoints = pts);
       return pts;
     });
+  }
+
+  void _syncMatchedLoad() {
+    final key = _routeDataKey(widget.request);
+    if (key == _matchedCacheKey && _matchedSegments.isNotEmpty) return;
+    _matchedCacheKey = key;
+    unawaited(() async {
+      final segs = await loadMatchedRouteSegments(widget.request);
+      if (!mounted) return;
+      setState(() => _matchedSegments = segs);
+    }());
   }
 
   void _releaseMapController() {
@@ -382,51 +405,49 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
 
   Set<Polyline> _buildPolylines(List<List<LatLng>>? paths) {
     final set = <Polyline>{};
+    final hasMatched = _matchedSegments.isNotEmpty ||
+        widget.request.tripLegs
+            .any((l) => (l.matchedRoutePolylineEncoded ?? '').isNotEmpty);
 
-    final plannedPoints = <LatLng>[];
-    for (final leg in widget.request.tripLegs) {
-      if (leg.routePolylineEncoded != null && leg.routePolylineEncoded!.isNotEmpty) {
-        plannedPoints.addAll(decodePipePolyline(leg.routePolylineEncoded));
-      }
-    }
-
-    if (plannedPoints.isNotEmpty) {
-      set.add(
-        Polyline(
-          polylineId: const PolylineId('planned_route_polyline'),
-          points: plannedPoints,
-          color: Colors.grey.withValues(alpha: 0.6),
-          width: 4,
-          patterns: [PatternItem.dash(10), PatternItem.gap(10)],
-        ),
-      );
-    } else {
+    // Planned corridor only for short local trips — never draw Oman→India lines.
+    if (!hasMatched && (paths == null || paths.every((p) => p.length < 2))) {
       final start = tripMapStartTarget(widget.request);
       final dest = tripMapDestinationTarget(widget.request);
-      if (start != null && dest != null && (start.latitude != dest.latitude || start.longitude != dest.longitude)) {
-        set.add(
-          Polyline(
-            polylineId: const PolylineId('planned_route_line'),
-            points: [start, dest],
-            color: Colors.grey.withValues(alpha: 0.5),
-            width: 3,
-            patterns: [PatternItem.dash(10), PatternItem.gap(10)],
-          ),
+      if (start != null &&
+          dest != null &&
+          (start.latitude != dest.latitude ||
+              start.longitude != dest.longitude)) {
+        final plannedM = GeoUtils.distanceMeters(
+          start.latitude,
+          start.longitude,
+          dest.latitude,
+          dest.longitude,
         );
+        if (plannedM > 0 && plannedM <= 40000) {
+          set.add(
+            Polyline(
+              polylineId: const PolylineId('planned_route_line'),
+              points: [start, dest],
+              color: Colors.grey.withValues(alpha: 0.35),
+              width: 3,
+              patterns: [PatternItem.dash(10), PatternItem.gap(10)],
+            ),
+          );
+        }
       }
     }
 
+    // Layer A — live / provisional GPS trail (high contrast).
     if (paths != null) {
       for (var i = 0; i < paths.length; i++) {
         final display = mapDisplayRoutePoints(paths[i]);
         if (display.length < 2) continue;
-        
         set.add(
           Polyline(
             polylineId: PolylineId('trip_route_shadow_$i'),
             points: display,
-            color: AppColors.primaryDark.withValues(alpha: 0.35),
-            width: 10,
+            color: AppColors.primaryDark.withValues(alpha: 0.45),
+            width: 11,
             jointType: JointType.round,
             startCap: Cap.roundCap,
             endCap: Cap.roundCap,
@@ -434,10 +455,10 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         );
         set.add(
           Polyline(
-            polylineId: PolylineId('trip_route_$i'),
+            polylineId: PolylineId('trip_route_live_$i'),
             points: display,
-            color: AppColors.primary,
-            width: 6,
+            color: AppColors.primary.withValues(alpha: 0.95),
+            width: hasMatched ? 5 : 7,
             jointType: JointType.round,
             startCap: Cap.roundCap,
             endCap: Cap.roundCap,
@@ -445,7 +466,95 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         );
       }
     }
+
+    // Layer B — official matched segments (skip absurd teleport matches).
+    final segments = (_matchedSegments.isNotEmpty
+            ? _matchedSegments
+            : widget.request.tripLegs
+                .where((l) =>
+                    (l.matchedRoutePolylineEncoded ?? '').isNotEmpty &&
+                    !l.hasAbsurdOfficialDistance)
+                .map(
+                  (l) => RouteSegmentModel(
+                    segId: '${l.legId}_matched',
+                    legId: l.legId,
+                    kind: RouteSegmentKind.mapMatched,
+                    confidence: l.matchConfidence ?? 0.7,
+                    lengthM: (l.officialDistanceKm ?? 0) * 1000,
+                    polylineEncoded: l.matchedRoutePolylineEncoded!,
+                  ),
+                )
+                .toList())
+        .where((seg) {
+      TripLegModel? leg;
+      for (final l in widget.request.tripLegs) {
+        if (l.legId == seg.legId) {
+          leg = l;
+          break;
+        }
+      }
+      if (leg?.hasAbsurdOfficialDistance == true) return false;
+      final km = seg.lengthM / 1000.0;
+      if (km <= 0) return true;
+      final gps = leg?.provisionalDistanceKm ??
+          leg?.actualDistanceKmFromTrack;
+      final gpsOrTrip = gps ??
+          (widget.request.effectiveDistanceKm > 0
+              ? widget.request.effectiveDistanceKm
+              : null);
+      return !DistanceSanity.isOfficialAbsurd(
+        officialKm: km,
+        gpsKm: gpsOrTrip,
+        plannedKm: leg?.plannedDistanceKm,
+        travelMinutes: leg?.travelDurationMinutes ??
+            widget.request.totalTravelDurationMinutes,
+      );
+    }).toList();
+
+    for (var i = 0; i < segments.length; i++) {
+      final seg = segments[i];
+      final pts = mapDisplayRoutePoints(decodePipePolyline(seg.polylineEncoded));
+      if (pts.length < 2) continue;
+      final style = _segmentStyle(seg.kind);
+      set.add(
+        Polyline(
+          polylineId: PolylineId('matched_seg_$i'),
+          points: pts,
+          color: style.color,
+          width: style.width,
+          patterns: style.dashed
+              ? [PatternItem.dash(14), PatternItem.gap(8)]
+              : const <PatternItem>[],
+          jointType: JointType.round,
+          startCap: Cap.roundCap,
+          endCap: Cap.roundCap,
+        ),
+      );
+    }
     return set;
+  }
+
+  ({Color color, int width, bool dashed}) _segmentStyle(RouteSegmentKind kind) {
+    switch (kind) {
+      case RouteSegmentKind.gpsVerified:
+        return (
+          color: AppColors.primaryDark,
+          width: 7,
+          dashed: false,
+        );
+      case RouteSegmentKind.mapMatched:
+        return (
+          color: AppColors.primary,
+          width: 6,
+          dashed: false,
+        );
+      case RouteSegmentKind.estimated:
+        return (
+          color: AppColors.warning,
+          width: 5,
+          dashed: true,
+        );
+    }
   }
 
   Set<Marker> _buildMarkers(List<List<LatLng>> paths) {
@@ -888,18 +997,20 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
                         child: _RoutePreviewStrip(
                           from: leg?.fromLocation ?? request.fromLocation,
                           to: leg?.toLocation ?? request.toLocation,
-                          distanceKm: request.totalDistanceKm > 0
-                              ? request.totalDistanceKm
+                          distanceKm: request.effectiveDistanceKm > 0
+                              ? request.effectiveDistanceKm
                               : request.distance,
+                          distanceLabel: request.displayDistanceLabel,
                           isLive: _isLiveTrip,
                         ),
                       )
                     : _RoutePreviewStrip(
                         from: leg?.fromLocation ?? request.fromLocation,
                         to: leg?.toLocation ?? request.toLocation,
-                        distanceKm: request.totalDistanceKm > 0
-                            ? request.totalDistanceKm
+                        distanceKm: request.effectiveDistanceKm > 0
+                            ? request.effectiveDistanceKm
                             : request.distance,
+                        distanceLabel: request.displayDistanceLabel,
                         isLive: _isLiveTrip,
                       ),
               ),
@@ -974,12 +1085,14 @@ class _RoutePreviewStrip extends StatelessWidget {
     required this.from,
     required this.to,
     this.distanceKm,
+    this.distanceLabel,
     this.isLive = false,
   });
 
   final String from;
   final String to;
   final double? distanceKm;
+  final String? distanceLabel;
   final bool isLive;
 
   @override
@@ -1029,12 +1142,25 @@ class _RoutePreviewStrip extends StatelessWidget {
               color: AppColors.primary.withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(20),
             ),
-            child: Text(
-              '${distanceKm!.toStringAsFixed(1)} km',
-              style: AppTextStyles.labelSmall.copyWith(
-                color: AppColors.primary,
-                fontWeight: FontWeight.w700,
-              ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                Text(
+                  '${distanceKm!.toStringAsFixed(1)} km',
+                  style: AppTextStyles.labelSmall.copyWith(
+                    color: AppColors.primary,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                if (distanceLabel != null && distanceLabel!.isNotEmpty)
+                  Text(
+                    distanceLabel!,
+                    style: AppTextStyles.labelSmall.copyWith(
+                      color: AppColors.textSecondary,
+                      fontSize: 10,
+                    ),
+                  ),
+              ],
             ),
           ),
         ],

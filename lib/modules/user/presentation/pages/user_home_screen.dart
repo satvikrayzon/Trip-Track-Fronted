@@ -11,6 +11,7 @@ import '../../../../core/di/service_locator.dart';
 import '../../../../core/routes/app_routes.dart';
 import '../../../../app/router/routes.dart';
 import '../../../../app/router/navigation_helper.dart';
+import '../../../../core/services/punch_reminder_service.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/utils/device_utils.dart';
 import '../../../../core/utils/font_utils.dart';
@@ -215,9 +216,11 @@ class _UserHomeScreenState extends State<UserHomeScreen> {
     final isDesktop = !AdaptiveLayout.isCompact(context);
 
     final bannerContent = GestureDetector(
-      onTap: () => AppNavigation.to(
-        AppRoutes.userRequestDetails,
-        arguments: trip,
+      onTap: () => unawaited(
+        AppNavigation.to(
+          AppRoutes.userRequestDetails,
+          arguments: trip,
+        ).then((_) => _controller.refresh()),
       ),
       child: Container(
         width: double.infinity,
@@ -305,10 +308,58 @@ class _UserHomeScreenState extends State<UserHomeScreen> {
       ),
     );
 
+    final reminderListenable =
+        ServiceLocator.I.has<PunchReminderService>()
+            ? ServiceLocator.I.get<PunchReminderService>().reminder
+            : null;
+
+    final withReminder = reminderListenable == null
+        ? bannerContent
+        : AnimatedBuilder(
+            animation: reminderListenable,
+            builder: (context, _) {
+              final reminder = reminderListenable.value;
+              if (reminder == null ||
+                  reminder.requestId != trip.requestId) {
+                return bannerContent;
+              }
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  bannerContent,
+                  SizedBox(height: 10.scp(context)),
+                  Container(
+                    padding: EdgeInsets.all(12.scp(context)),
+                    decoration: BoxDecoration(
+                      color: reminder.isUrgent
+                          ? const Color(0xFFFFF3E0)
+                          : const Color(0xFFE0F2F1),
+                      borderRadius: BorderRadius.circular(12.scp(context)),
+                      border: Border.all(
+                        color: (reminder.isUrgent
+                                ? AppColors.warning
+                                : AppColors.primary)
+                            .withValues(alpha: 0.35),
+                      ),
+                    ),
+                    child: Text(
+                      '${reminder.title}: ${reminder.message}',
+                      style: FontUtilities.style(
+                        fontSize: 12.scp(context),
+                        fontColor: AppColors.textPrimary,
+                        fontWeight: FWT.medium,
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            },
+          );
+
     if (isDesktop) {
-      return HoverWidget(child: bannerContent);
+      return HoverWidget(child: withReminder);
     }
-    return bannerContent;
+    return withReminder;
   }
 
   Widget _buildResponsiveStatCard(
@@ -759,9 +810,11 @@ class _UserHomeScreenState extends State<UserHomeScreen> {
               showEditButton: canEditTravelRequest(request),
               showDeleteButton: canDeleteTravelRequest(request),
               isDeleteLoading: isDeleting,
-              onTap: () => AppNavigation.to(
-                AppRoutes.userRequestDetails,
-                arguments: request,
+              onTap: () => unawaited(
+                AppNavigation.to(
+                  AppRoutes.userRequestDetails,
+                  arguments: request,
+                ).then((_) => _controller.refresh()),
               ),
               onEdit: () => _handleEditRequest(request),
               onDelete: () => _handleDeleteRequest(request),

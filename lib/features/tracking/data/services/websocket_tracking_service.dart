@@ -36,6 +36,8 @@ class WebSocketTrackingService {
   final _locationUpdatesController =
       StreamController<Map<String, dynamic>>.broadcast();
   final _tripDeleteController = StreamController<String>.broadcast();
+  final _routeMatchedController =
+      StreamController<Map<String, dynamic>>.broadcast();
   final Map<String, TrackedEmployee> _roster = {};
 
   bool _connected = false;
@@ -62,6 +64,10 @@ class WebSocketTrackingService {
 
   /// Emits a trip/request id when it is deleted.
   Stream<String> get tripDeletes => _tripDeleteController.stream;
+
+  /// Official map-match completed — payload matches Nest `route.matched`.
+  Stream<Map<String, dynamic>> get routeMatchedUpdates =>
+      _routeMatchedController.stream;
 
   bool get isConnected => _connected;
   bool get isBackendUnavailable => _backendUnavailable;
@@ -290,6 +296,21 @@ class WebSocketTrackingService {
         final id = payload?.toString() ?? '';
         if (id.isNotEmpty) {
           _tripDeleteController.add(id);
+        }
+      }
+
+      if (eventName == 'route.matched' || eventName == 'trip.route.matched') {
+        Map<String, dynamic>? dataMap;
+        if (payload is Map) {
+          dataMap = Map<String, dynamic>.from(payload);
+        } else if (payload is String) {
+          try {
+            final decoded = jsonDecode(payload);
+            if (decoded is Map) dataMap = Map<String, dynamic>.from(decoded);
+          } catch (_) {}
+        }
+        if (dataMap != null) {
+          _routeMatchedController.add(dataMap);
         }
       }
 
@@ -678,5 +699,6 @@ class WebSocketTrackingService {
     _tripRefetchController.close();
     _locationUpdatesController.close();
     _tripDeleteController.close();
+    _routeMatchedController.close();
   }
 }

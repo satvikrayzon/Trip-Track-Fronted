@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import '../../domain/entities/travel_request_entity.dart';
 import '../../../../core/constants/app_constants.dart';
+import '../../../../core/utils/distance_sanity.dart';
 
 /// GPS/time punch captured for a route or meeting event.
 class TripPunchModel {
@@ -91,11 +92,26 @@ class TripLegModel {
   final int? travelDurationMinutes;
   final int? meetingDurationMinutes;
 
-  /// From live GPS path (takes precedence in totalDistanceKm when set).
+  /// Provisional GPS / Haversine track distance (approximate; not billable).
   final double? actualDistanceKmFromTrack;
   final int? trackMovingDurationMinutes;
   final int? trackStoppedDurationMinutes;
   final String? routePolylineEncoded;
+
+  /// Backend map-matched official distance (billing source of truth).
+  final double? officialDistanceKm;
+
+  /// Server-reported provisional km (may mirror [actualDistanceKmFromTrack]).
+  final double? provisionalDistanceKm;
+
+  /// Official matched geometry (`lat,lng|...`).
+  final String? matchedRoutePolylineEncoded;
+
+  /// Match confidence 0–1 for this leg.
+  final double? matchConfidence;
+
+  /// Share of leg length that was gap-estimated (0–1).
+  final double? estimatedPct;
 
   const TripLegModel({
     required this.legId,
@@ -118,6 +134,11 @@ class TripLegModel {
     this.trackMovingDurationMinutes,
     this.trackStoppedDurationMinutes,
     this.routePolylineEncoded,
+    this.officialDistanceKm,
+    this.provisionalDistanceKm,
+    this.matchedRoutePolylineEncoded,
+    this.matchConfidence,
+    this.estimatedPct,
   });
 
   factory TripLegModel.fromMap(dynamic data) {
@@ -151,6 +172,17 @@ class TripLegModel {
       trackStoppedDurationMinutes:
           _parseInt(map['trackStoppedDurationMinutes']),
       routePolylineEncoded: map['routePolylineEncoded'] as String?,
+      officialDistanceKm: _parseDouble(
+        map['officialDistanceKm'] ?? map['officialKm'],
+      ),
+      provisionalDistanceKm: _parseDouble(
+        map['provisionalDistanceKm'] ?? map['provisionalKm'],
+      ),
+      matchedRoutePolylineEncoded:
+          map['matchedRoutePolylineEncoded'] as String? ??
+              map['matchedPolylineEncoded'] as String?,
+      matchConfidence: _parseDouble(map['matchConfidence'] ?? map['confidence']),
+      estimatedPct: _parseDouble(map['estimatedPct']),
     ).withRecalculatedMetrics();
   }
 
@@ -173,6 +205,48 @@ class TripLegModel {
   bool get isMeetingComplete =>
       isReturnLeg || (meetingStartPunch != null && meetingEndPunch != null);
   bool get isComplete => isTravelComplete && isMeetingComplete;
+
+  /// Prefer sane official matched km, then provisional GPS, then planned/punch.
+  double? get displayDistanceKm => DistanceSanity.selectLegKm(
+        officialKm: officialDistanceKm,
+        provisionalKm: provisionalDistanceKm,
+        trackKm: actualDistanceKmFromTrack,
+        plannedKm: plannedDistanceKm,
+        punchKm: actualDistanceKm,
+        travelMinutes: travelDurationMinutes,
+      );
+
+  bool get hasOfficialDistance {
+    final o = officialDistanceKm;
+    if (o == null || o <= 0) return false;
+    return !DistanceSanity.isOfficialAbsurd(
+      officialKm: o,
+      gpsKm: provisionalDistanceKm ?? actualDistanceKmFromTrack,
+      plannedKm: plannedDistanceKm,
+      travelMinutes: travelDurationMinutes,
+    );
+  }
+
+  String get displayDistanceLabel {
+    if (hasOfficialDistance) return 'Official';
+    if (provisionalDistanceKm != null || actualDistanceKmFromTrack != null) {
+      return 'Approx (GPS)';
+    }
+    if (plannedDistanceKm != null) return 'Planned';
+    return 'Distance';
+  }
+
+  /// True when stored official km is a teleport / map-match blow-up.
+  bool get hasAbsurdOfficialDistance {
+    final o = officialDistanceKm;
+    if (o == null || o <= 0) return false;
+    return DistanceSanity.isOfficialAbsurd(
+      officialKm: o,
+      gpsKm: provisionalDistanceKm ?? actualDistanceKmFromTrack,
+      plannedKm: plannedDistanceKm,
+      travelMinutes: travelDurationMinutes,
+    );
+  }
 
   String get displayTitle {
     if (isReturnLeg) return 'Return to $toLocation';
@@ -232,6 +306,15 @@ class TripLegModel {
     int? trackMovingDurationMinutes,
     int? trackStoppedDurationMinutes,
     String? routePolylineEncoded,
+    double? officialDistanceKm,
+    double? provisionalDistanceKm,
+    String? matchedRoutePolylineEncoded,
+    double? matchConfidence,
+    double? estimatedPct,
+    bool clearOfficialDistanceKm = false,
+    bool clearMatchedRoutePolylineEncoded = false,
+    bool clearMatchConfidence = false,
+    bool clearEstimatedPct = false,
   }) {
     return TripLegModel(
       legId: legId ?? this.legId,
@@ -259,6 +342,19 @@ class TripLegModel {
       trackStoppedDurationMinutes:
           trackStoppedDurationMinutes ?? this.trackStoppedDurationMinutes,
       routePolylineEncoded: routePolylineEncoded ?? this.routePolylineEncoded,
+      officialDistanceKm: clearOfficialDistanceKm
+          ? null
+          : (officialDistanceKm ?? this.officialDistanceKm),
+      provisionalDistanceKm:
+          provisionalDistanceKm ?? this.provisionalDistanceKm,
+      matchedRoutePolylineEncoded: clearMatchedRoutePolylineEncoded
+          ? null
+          : (matchedRoutePolylineEncoded ?? this.matchedRoutePolylineEncoded),
+      matchConfidence: clearMatchConfidence
+          ? null
+          : (matchConfidence ?? this.matchConfidence),
+      estimatedPct:
+          clearEstimatedPct ? null : (estimatedPct ?? this.estimatedPct),
     );
   }
 
@@ -284,6 +380,11 @@ class TripLegModel {
       'trackMovingDurationMinutes': trackMovingDurationMinutes,
       'trackStoppedDurationMinutes': trackStoppedDurationMinutes,
       'routePolylineEncoded': routePolylineEncoded,
+      'officialDistanceKm': officialDistanceKm,
+      'provisionalDistanceKm': provisionalDistanceKm,
+      'matchedRoutePolylineEncoded': matchedRoutePolylineEncoded,
+      'matchConfidence': matchConfidence,
+      'estimatedPct': estimatedPct,
     };
   }
 
@@ -625,12 +726,71 @@ class TravelRequestModel extends TravelRequestEntity {
     return labels.where((label) => label.trim().isNotEmpty).join(' → ');
   }
 
-  /// Best distance for allowance: leg/GPS total, API total, or odometer meters.
+  /// Best distance for allowance: sane leg total, API total, or odometer meters.
   double get effectiveDistanceKm {
+    final saneLegsKm = _calculateSummary(tripLegs).totalDistanceKm;
+    if (saneLegsKm > 0) {
+      if (totalDistanceKm <= 0) return saneLegsKm;
+      // Prefer GPS/sane legs when stored trip total was inflated by bad match.
+      if (totalDistanceKm > saneLegsKm * DistanceSanity.maxOfficialVsGpsRatio &&
+          totalDistanceKm - saneLegsKm > DistanceSanity.minAbsDeltaKm) {
+        return saneLegsKm;
+      }
+      if (DistanceSanity.isOfficialAbsurd(
+        officialKm: totalDistanceKm,
+        gpsKm: saneLegsKm,
+        travelMinutes: totalTravelDurationMinutes,
+      )) {
+        return saneLegsKm;
+      }
+      return totalDistanceKm;
+    }
     if (totalDistanceKm > 0) return totalDistanceKm;
     final meters = distance ?? 0;
     if (meters > 0) return meters / 1000;
     return 0;
+  }
+
+  /// True when any leg has backend-matched official km that passes sanity.
+  bool get hasOfficialDistance =>
+      tripLegs.any((l) => l.hasOfficialDistance);
+
+  String get displayDistanceLabel {
+    if (hasOfficialDistance) return 'Official';
+    if (tripLegs.any((l) =>
+        l.provisionalDistanceKm != null ||
+        l.actualDistanceKmFromTrack != null)) {
+      return 'Approx (GPS)';
+    }
+    return 'Travelled';
+  }
+
+  /// Drop absurd official km / matched polylines (teleport leftovers) and
+  /// recompute totals so details matches the list GPS distance.
+  TravelRequestModel sanitizeAbsurdOfficialDistances() {
+    var changed = false;
+    final cleaned = tripLegs.map((leg) {
+      if (!leg.hasAbsurdOfficialDistance) return leg;
+      changed = true;
+      return leg.copyWith(
+        clearOfficialDistanceKm: true,
+        clearMatchedRoutePolylineEncoded: true,
+        clearMatchConfidence: true,
+        clearEstimatedPct: true,
+      );
+    }).toList();
+    if (!changed) {
+      // Still recompute if total was inflated vs leg GPS.
+      final sane = _calculateSummary(tripLegs).totalDistanceKm;
+      if (totalDistanceKm > 0 &&
+          sane > 0 &&
+          totalDistanceKm > sane * DistanceSanity.maxOfficialVsGpsRatio &&
+          totalDistanceKm - sane > DistanceSanity.minAbsDeltaKm) {
+        return copyWith(tripLegs: tripLegs).withRecalculatedSummary();
+      }
+      return this;
+    }
+    return copyWith(tripLegs: cleaned).withRecalculatedSummary();
   }
 
   /// Allowance from API or distance × vehicle/fuel rate (₹/km).
@@ -739,12 +899,20 @@ class TravelRequestModel extends TravelRequestEntity {
       );
     }
 
-    return copyWith(
+    final merged = copyWith(
       fromLocation: mergedFrom,
       toLocation: mergedTo,
+      userName: userName.trim().isNotEmpty ? userName : local.userName,
+      employeeCode: (employeeCode ?? '').trim().isNotEmpty
+          ? employeeCode
+          : local.employeeCode,
+      city: city.trim().isNotEmpty ? city : local.city,
+      vehicleType: vehicleType.trim().isNotEmpty ? vehicleType : local.vehicleType,
       fuelType: fuelType ?? local.fuelType,
-      totalDistanceKm: totalDistanceKm > 0 ? totalDistanceKm : local.totalDistanceKm,
-      travelAllowance: travelAllowance > 0 ? travelAllowance : local.travelAllowance,
+      totalDistanceKm:
+          totalDistanceKm > 0 ? totalDistanceKm : local.totalDistanceKm,
+      travelAllowance:
+          travelAllowance > 0 ? travelAllowance : local.travelAllowance,
       fuelRatePerKm: fuelRatePerKm ?? local.fuelRatePerKm,
       clientName: clientName.isNotEmpty ? clientName : local.clientName,
       purpose: purpose ?? local.purpose,
@@ -753,6 +921,8 @@ class TravelRequestModel extends TravelRequestEntity {
       endCoordinates: endCoordinates ?? local.endCoordinates,
       startAddress: startAddress ?? local.startAddress,
       endAddress: endAddress ?? local.endAddress,
+      startImageUrl: startImageUrl ?? local.startImageUrl,
+      endImageUrl: endImageUrl ?? local.endImageUrl,
       tripLegs: mergedLegs,
       punches: punches.isNotEmpty ? punches : local.punches,
       apiHasDeparted: apiHasDeparted ?? local.apiHasDeparted,
@@ -768,7 +938,41 @@ class TravelRequestModel extends TravelRequestEntity {
       routePointCount:
           routePointCount > 0 ? routePointCount : local.routePointCount,
       mongoDocumentId: mongoDocumentId ?? local.mongoDocumentId,
+      totalTravelDurationMinutes: totalTravelDurationMinutes > 0
+          ? totalTravelDurationMinutes
+          : local.totalTravelDurationMinutes,
+      totalMeetingDurationMinutes: totalMeetingDurationMinutes > 0
+          ? totalMeetingDurationMinutes
+          : local.totalMeetingDurationMinutes,
+      totalMeetings: totalMeetings > 0 ? totalMeetings : local.totalMeetings,
     ).withRecalculatedSummary();
+
+    // Recalc can zero card metrics when a partial payload omitted punches;
+    // keep the richer values so home cards don't lose fields after details.
+    return merged.copyWith(
+      vehicleType: merged.vehicleType.trim().isNotEmpty
+          ? merged.vehicleType
+          : local.vehicleType,
+      fuelType: merged.fuelType ?? local.fuelType,
+      fuelRatePerKm: merged.fuelRatePerKm ?? local.fuelRatePerKm,
+      travelAllowance: merged.travelAllowance > 0
+          ? merged.travelAllowance
+          : local.travelAllowance,
+      totalDistanceKm: merged.totalDistanceKm > 0
+          ? merged.totalDistanceKm
+          : local.totalDistanceKm,
+      totalTravelDurationMinutes: merged.totalTravelDurationMinutes > 0
+          ? merged.totalTravelDurationMinutes
+          : local.totalTravelDurationMinutes,
+      totalMeetingDurationMinutes: merged.totalMeetingDurationMinutes > 0
+          ? merged.totalMeetingDurationMinutes
+          : local.totalMeetingDurationMinutes,
+      totalMeetings:
+          merged.totalMeetings > 0 ? merged.totalMeetings : local.totalMeetings,
+      userName: merged.userName.trim().isNotEmpty ? merged.userName : local.userName,
+      clientName:
+          merged.clientName.isNotEmpty ? merged.clientName : local.clientName,
+    );
   }
 
   static List<TripLegModel> _mergeLegPunches(
@@ -838,6 +1042,19 @@ class TravelRequestModel extends TravelRequestEntity {
               trackStoppedDurationMinutes:
                   remoteLeg.trackStoppedDurationMinutes ??
                       localLeg.trackStoppedDurationMinutes,
+              officialDistanceKm: _preferSaneOfficialKm(
+                remote: remoteLeg,
+                local: localLeg,
+              ),
+              provisionalDistanceKm: remoteLeg.provisionalDistanceKm ??
+                  localLeg.provisionalDistanceKm,
+              matchedRoutePolylineEncoded: _preferSaneMatchedPolyline(
+                remote: remoteLeg,
+                local: localLeg,
+              ),
+              matchConfidence:
+                  remoteLeg.matchConfidence ?? localLeg.matchConfidence,
+              estimatedPct: remoteLeg.estimatedPct ?? localLeg.estimatedPct,
             )
             .withRecalculatedMetrics(),
       );
@@ -1226,11 +1443,81 @@ class TravelRequestModel extends TravelRequestEntity {
     return {'latitude': latitude, 'longitude': longitude};
   }
 
+  static double? _preferSaneOfficialKm({
+    required TripLegModel remote,
+    required TripLegModel local,
+  }) {
+    final gps = remote.provisionalDistanceKm ??
+        remote.actualDistanceKmFromTrack ??
+        local.provisionalDistanceKm ??
+        local.actualDistanceKmFromTrack;
+    final minutes =
+        remote.travelDurationMinutes ?? local.travelDurationMinutes;
+    final planned = remote.plannedDistanceKm ?? local.plannedDistanceKm;
+
+    for (final candidate in [
+      remote.officialDistanceKm,
+      local.officialDistanceKm,
+    ]) {
+      if (candidate == null || candidate <= 0) continue;
+      if (!DistanceSanity.isOfficialAbsurd(
+        officialKm: candidate,
+        gpsKm: gps,
+        plannedKm: planned,
+        travelMinutes: minutes,
+      )) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  static String? _preferSaneMatchedPolyline({
+    required TripLegModel remote,
+    required TripLegModel local,
+  }) {
+    final gps = remote.provisionalDistanceKm ??
+        remote.actualDistanceKmFromTrack ??
+        local.provisionalDistanceKm ??
+        local.actualDistanceKmFromTrack;
+    final minutes =
+        remote.travelDurationMinutes ?? local.travelDurationMinutes;
+    final planned = remote.plannedDistanceKm ?? local.plannedDistanceKm;
+
+    bool absurd(TripLegModel leg) {
+      final o = leg.officialDistanceKm;
+      if (o == null || o <= 0) return false;
+      return DistanceSanity.isOfficialAbsurd(
+        officialKm: o,
+        gpsKm: gps,
+        plannedKm: planned,
+        travelMinutes: minutes,
+      );
+    }
+
+    if (remote.matchedRoutePolylineEncoded != null &&
+        remote.matchedRoutePolylineEncoded!.isNotEmpty &&
+        !absurd(remote)) {
+      return remote.matchedRoutePolylineEncoded;
+    }
+    if (local.matchedRoutePolylineEncoded != null &&
+        local.matchedRoutePolylineEncoded!.isNotEmpty &&
+        !absurd(local)) {
+      return local.matchedRoutePolylineEncoded;
+    }
+    return null;
+  }
+
   static _TripSummary _calculateSummary(List<TripLegModel> legs) {
     double distKm(TripLegModel leg) =>
-        leg.actualDistanceKmFromTrack ??
-        leg.plannedDistanceKm ??
-        leg.actualDistanceKm ??
+        DistanceSanity.selectLegKm(
+          officialKm: leg.officialDistanceKm,
+          provisionalKm: leg.provisionalDistanceKm,
+          trackKm: leg.actualDistanceKmFromTrack,
+          plannedKm: leg.plannedDistanceKm,
+          punchKm: leg.actualDistanceKm,
+          travelMinutes: leg.travelDurationMinutes,
+        ) ??
         0;
 
     return _TripSummary(

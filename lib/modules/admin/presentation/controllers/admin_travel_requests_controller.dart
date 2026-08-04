@@ -135,7 +135,22 @@ class AdminTravelRequestsController {
 
 
       if (fetchedItems.isNotEmpty) {
-        _allRequests = fetchedItems;
+        // Keep richer in-memory card fields when list API omits them.
+        final previousByKey = <String, TravelRequestModel>{};
+        for (final r in _allRequests) {
+          if (r.requestId.isNotEmpty) previousByKey[r.requestId] = r;
+          if (r.restResourceId.isNotEmpty) {
+            previousByKey[r.restResourceId] = r;
+          }
+          if (r.tripId.isNotEmpty) previousByKey[r.tripId] = r;
+        }
+        _allRequests = fetchedItems.map((item) {
+          final prev = previousByKey[item.requestId] ??
+              previousByKey[item.restResourceId] ??
+              (item.tripId.isNotEmpty ? previousByKey[item.tripId] : null);
+          if (prev == null) return item.ensureTripLegs();
+          return item.mergePreservingLocalProgress(prev).ensureTripLegs();
+        }).toList();
         _allRequests.sort((a, b) => b.requestDate.compareTo(a.requestDate));
 
           // `/travel-requests` may omit `user.name` / `user.employeeCode` for
@@ -283,10 +298,12 @@ class AdminTravelRequestsController {
               tripMatchesRealtimeKey(r, updatedRequest.tripId)),
     );
     if (index == -1) {
-      _allRequests.insert(0, updatedRequest);
+      _allRequests.insert(0, updatedRequest.ensureTripLegs());
       _allRequests.sort((a, b) => b.requestDate.compareTo(a.requestDate));
     } else {
-      _allRequests[index] = updatedRequest;
+      final old = _allRequests[index];
+      _allRequests[index] =
+          updatedRequest.mergePreservingLocalProgress(old).ensureTripLegs();
     }
     _applyFilters();
   }

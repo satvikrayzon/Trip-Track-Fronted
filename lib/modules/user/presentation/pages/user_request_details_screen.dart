@@ -7,6 +7,7 @@ import '../../../../core/routes/app_routes.dart';
 import '../../../../core/constants/app_constants.dart';
 import '../../../../core/di/service_locator.dart';
 import '../../../../core/layout/adaptive_layout.dart';
+import '../../../../core/services/punch_reminder_service.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../core/theme/app_text_styles.dart';
 import '../../../../core/widgets/app_button.dart';
@@ -86,6 +87,7 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
                   _controller.request,
                   _controller.isPunching,
                   _controller.isDeleting,
+                  _controller.punchReminder,
                 ]),
                 builder: (context, _) {
                   final footer = _buildSheetFooter(context, _controller, request);
@@ -106,6 +108,21 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
                 ),
                 children: [
                   _buildStatusCard(request),
+                  AnimatedBuilder(
+                    animation: _controller.punchReminder,
+                    builder: (context, _) {
+                      final reminder = _controller.punchReminder.value;
+                      if (reminder == null) {
+                        return const SizedBox.shrink();
+                      }
+                      return Padding(
+                        padding: const EdgeInsets.only(
+                          top: AppConstants.defaultPadding,
+                        ),
+                        child: _buildPunchReminderBanner(reminder),
+                      );
+                    },
+                  ),
                   const SizedBox(height: AppConstants.defaultPadding),
                   _buildLiveGpsCard(request),
                   if (_canViewTrackingCoverage) ...[
@@ -211,8 +228,8 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
               Expanded(
                 child: _buildSummaryTile(
                   Icons.straighten,
-                  '${request.totalDistanceKm.toStringAsFixed(2)} km',
-                  'Travelled',
+                  '${request.effectiveDistanceKm.toStringAsFixed(2)} km',
+                  request.displayDistanceLabel,
                 ),
               ),
               Expanded(
@@ -680,18 +697,14 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
   }
 
   Widget _buildLegMetrics(TripLegModel leg) {
-    final distKm = leg.actualDistanceKmFromTrack ??
-        leg.plannedDistanceKm ??
-        leg.actualDistanceKm;
+    final distKm = leg.displayDistanceKm;
     return Row(
       children: [
         Expanded(
           child: _buildSmallMetric(
             Icons.straighten,
             distKm == null ? '-' : '${distKm.toStringAsFixed(2)} km',
-            leg.actualDistanceKmFromTrack != null
-                ? 'Distance (GPS)'
-                : 'Distance',
+            leg.displayDistanceLabel,
           ),
         ),
         const SizedBox(width: 8),
@@ -842,18 +855,66 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
     return actions;
   }
 
+  Widget _buildPunchReminderBanner(PunchReminderState reminder) {
+    final color = reminder.isUrgent ? AppColors.warning : AppColors.primary;
+    final bg = reminder.isUrgent
+        ? const Color(0xFFFFF3E0)
+        : const Color(0xFFE0F2F1);
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: color.withValues(alpha: 0.35)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(
+            reminder.isUrgent
+                ? Icons.warning_amber_rounded
+                : Icons.notifications_active_outlined,
+            color: color,
+            size: 22,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  reminder.title,
+                  style: AppTextStyles.titleSmall.copyWith(
+                    color: AppColors.textPrimary,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  reminder.message,
+                  style: AppTextStyles.bodySmall.copyWith(
+                    color: AppColors.textSecondary,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget? _buildActionsContent(
     BuildContext context,
     RequestDetailsController controller,
     TravelRequestModel request,
   ) {
     final current = controller.request.value ?? request;
-
-
+    final reminder = controller.punchReminder.value;
 
     final actionLabel = controller.primaryActionLabel;
     if (actionLabel.isNotEmpty) {
-      return AppButton(
+      final button = AppButton(
         text: actionLabel,
         type: AppButtonType.primary,
         size: AppButtonSize.large,
@@ -861,6 +922,16 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
         isLoading: controller.isPunching.value,
         onPressed:
             controller.isPunching.value ? null : controller.punchNextStep,
+      );
+      if (reminder == null) return button;
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _buildPunchReminderBanner(reminder),
+          const SizedBox(height: 10),
+          button,
+        ],
       );
     }
 

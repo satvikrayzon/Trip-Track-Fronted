@@ -9,6 +9,7 @@ class HiveDatabase {
   static Box<Map>? _routePointsBox;
   static Box<Map>? _trackingEventsBox;
   static Box<Map>? _trackingCoverageCacheBox;
+  static Box<Map>? _matchedRouteCacheBox;
   static Box<Map>? _sessionBox;
 
   static HiveDatabase? _instance;
@@ -38,6 +39,8 @@ class HiveDatabase {
       _trackingEventsBox = await Hive.openBox<Map>('tracking_events');
       _trackingCoverageCacheBox =
           await Hive.openBox<Map>('tracking_coverage_cache');
+      _matchedRouteCacheBox =
+          await Hive.openBox<Map>('matched_route_cache');
       _sessionBox = await Hive.openBox<Map>('app_session');
 
     } catch (e) {
@@ -54,6 +57,7 @@ class HiveDatabase {
     await _routePointsBox?.close();
     await _trackingEventsBox?.close();
     await _trackingCoverageCacheBox?.close();
+    await _matchedRouteCacheBox?.close();
     await _sessionBox?.close();
   }
 
@@ -186,55 +190,120 @@ class HiveDatabase {
 
   // Offline Travel Requests Operations
   Future<void> saveTravelRequest(Map<String, dynamic> requestData) async {
-    final request = {
-      'requestId': requestData['requestId'] ??
-          DateTime.now().millisecondsSinceEpoch.toString(),
-      'userId': requestData['userId'] ?? '',
-      'name': requestData['name'] ?? requestData['userName'] ?? '',
-      'userName': requestData['userName'] ?? requestData['name'] ?? '',
-      if (requestData['_id'] != null) '_id': requestData['_id'],
-      'city': requestData['city'] ?? '',
-      'fromLocation': requestData['fromLocation'] ?? '',
-      'toLocation': requestData['toLocation'] ?? '',
-      'clientName': requestData['clientName'],
-      'vehicleType': requestData['vehicleType'] ?? '',
-      'fuelType': requestData['fuelType'],
-      'purpose': requestData['purpose'],
-      'notes': requestData['notes'],
-      'requestDate':
-          requestData['requestDate'] ?? DateTime.now().toIso8601String(),
-      'status': requestData['status'] ?? 'Start Missing',
-      'startImageUrl': requestData['startImageUrl'],
-      'endImageUrl': requestData['endImageUrl'],
-      'startCoordinates': requestData['startCoordinates'],
-      'endCoordinates': requestData['endCoordinates'],
-      'startAddress': requestData['startAddress'],
-      'endAddress': requestData['endAddress'],
-      'stops': requestData['stops'],
-      'tripLegs': requestData['tripLegs'],
-      'totalDistanceKm': requestData['totalDistanceKm'] ?? 0,
-      'totalTravelDurationMinutes':
-          requestData['totalTravelDurationMinutes'] ?? 0,
-      'totalMeetingDurationMinutes':
-          requestData['totalMeetingDurationMinutes'] ?? 0,
-      'totalMeetings': requestData['totalMeetings'] ?? 0,
-      'currentLegIndex': requestData['currentLegIndex'] ?? 0,
-      'trackingSessionId': requestData['trackingSessionId'],
-      'tripStartedAt': requestData['tripStartedAt'],
-      'tripEndedAt': requestData['tripEndedAt'],
-      'trackingStatus': requestData['trackingStatus'],
-      'enableLiveTracking': requestData['enableLiveTracking'] ?? true,
-      'routePointCount': requestData['routePointCount'] ?? 0,
-      'totalMovingMinutesFromTrack':
-          requestData['totalMovingMinutesFromTrack'] ?? 0,
-      'totalStoppedMinutesFromTrack':
-          requestData['totalStoppedMinutesFromTrack'] ?? 0,
-      'createdAt': DateTime.now().toIso8601String(),
+    final requestId = (requestData['requestId'] ??
+            DateTime.now().millisecondsSinceEpoch.toString())
+        .toString();
+    final existingRaw = _offlineTravelRequestsBox?.get(requestId);
+    final existing = existingRaw is Map
+        ? Map<String, dynamic>.from(existingRaw)
+        : <String, dynamic>{};
+
+    dynamic keep(dynamic incoming, dynamic fallback) {
+      if (incoming == null) return fallback;
+      if (incoming is String && incoming.trim().isEmpty) return fallback;
+      if (incoming is num && incoming == 0 && fallback is num && fallback != 0) {
+        return fallback;
+      }
+      if (incoming is List && incoming.isEmpty && fallback is List) {
+        return fallback;
+      }
+      return incoming;
+    }
+
+    final request = <String, dynamic>{
+      ...existing,
+      'requestId': requestId,
+      'userId': keep(requestData['userId'], existing['userId'] ?? ''),
+      'name': keep(
+        requestData['name'] ?? requestData['userName'],
+        existing['name'] ?? existing['userName'] ?? '',
+      ),
+      'userName': keep(
+        requestData['userName'] ?? requestData['name'],
+        existing['userName'] ?? existing['name'] ?? '',
+      ),
+      if (requestData['_id'] != null)
+        '_id': requestData['_id']
+      else if (existing['_id'] != null)
+        '_id': existing['_id'],
+      if (requestData['tripId'] != null || existing['tripId'] != null)
+        'tripId': keep(requestData['tripId'], existing['tripId']),
+      'employeeCode': keep(requestData['employeeCode'], existing['employeeCode']),
+      'city': keep(requestData['city'], existing['city'] ?? ''),
+      'fromLocation':
+          keep(requestData['fromLocation'], existing['fromLocation'] ?? ''),
+      'toLocation':
+          keep(requestData['toLocation'], existing['toLocation'] ?? ''),
+      'clientName': keep(requestData['clientName'], existing['clientName']),
+      'vehicleType':
+          keep(requestData['vehicleType'], existing['vehicleType'] ?? ''),
+      'fuelType': keep(requestData['fuelType'], existing['fuelType']),
+      'fuelRatePerKm':
+          keep(requestData['fuelRatePerKm'], existing['fuelRatePerKm']),
+      'travelAllowance':
+          keep(requestData['travelAllowance'], existing['travelAllowance']),
+      'purpose': keep(requestData['purpose'], existing['purpose']),
+      'notes': keep(requestData['notes'], existing['notes']),
+      'requestDate': keep(
+        requestData['requestDate'],
+        existing['requestDate'] ?? DateTime.now().toIso8601String(),
+      ),
+      'status': keep(
+        requestData['status'],
+        existing['status'] ?? 'Start Missing',
+      ),
+      'startImageUrl':
+          keep(requestData['startImageUrl'], existing['startImageUrl']),
+      'endImageUrl': keep(requestData['endImageUrl'], existing['endImageUrl']),
+      'startCoordinates':
+          keep(requestData['startCoordinates'], existing['startCoordinates']),
+      'endCoordinates':
+          keep(requestData['endCoordinates'], existing['endCoordinates']),
+      'startAddress': keep(requestData['startAddress'], existing['startAddress']),
+      'endAddress': keep(requestData['endAddress'], existing['endAddress']),
+      'stops': keep(requestData['stops'], existing['stops']),
+      'tripLegs': keep(requestData['tripLegs'], existing['tripLegs']),
+      'totalDistanceKm':
+          keep(requestData['totalDistanceKm'], existing['totalDistanceKm'] ?? 0),
+      'totalTravelDurationMinutes': keep(
+        requestData['totalTravelDurationMinutes'],
+        existing['totalTravelDurationMinutes'] ?? 0,
+      ),
+      'totalMeetingDurationMinutes': keep(
+        requestData['totalMeetingDurationMinutes'],
+        existing['totalMeetingDurationMinutes'] ?? 0,
+      ),
+      'totalMeetings':
+          keep(requestData['totalMeetings'], existing['totalMeetings'] ?? 0),
+      'currentLegIndex':
+          keep(requestData['currentLegIndex'], existing['currentLegIndex'] ?? 0),
+      'trackingSessionId':
+          keep(requestData['trackingSessionId'], existing['trackingSessionId']),
+      'tripStartedAt':
+          keep(requestData['tripStartedAt'], existing['tripStartedAt']),
+      'tripEndedAt': keep(requestData['tripEndedAt'], existing['tripEndedAt']),
+      'trackingStatus':
+          keep(requestData['trackingStatus'], existing['trackingStatus']),
+      'enableLiveTracking':
+          requestData['enableLiveTracking'] ??
+              existing['enableLiveTracking'] ??
+              true,
+      'routePointCount':
+          keep(requestData['routePointCount'], existing['routePointCount'] ?? 0),
+      'totalMovingMinutesFromTrack': keep(
+        requestData['totalMovingMinutesFromTrack'],
+        existing['totalMovingMinutesFromTrack'] ?? 0,
+      ),
+      'totalStoppedMinutesFromTrack': keep(
+        requestData['totalStoppedMinutesFromTrack'],
+        existing['totalStoppedMinutesFromTrack'] ?? 0,
+      ),
+      'createdAt': existing['createdAt'] ?? DateTime.now().toIso8601String(),
       'updatedAt': DateTime.now().toIso8601String(),
-      'isSynced': false,
-      'lastSyncAt': null
+      'isSynced': requestData['isSynced'] ?? existing['isSynced'] ?? false,
+      'lastSyncAt': requestData['lastSyncAt'] ?? existing['lastSyncAt'],
     };
-    await _offlineTravelRequestsBox?.put(request['requestId'], request);
+    await _offlineTravelRequestsBox?.put(requestId, request);
   }
 
   Future<List<Map>> getOfflineTravelRequestsForUser(String userId) async {
@@ -554,6 +623,28 @@ class HiveDatabase {
     String requestId,
   ) async {
     final row = _trackingCoverageCacheBox?.get(requestId);
+    if (row == null) return null;
+    return Map<String, dynamic>.from(row);
+  }
+
+  // --- Matched route (official km / segments) ---
+
+  Future<void> saveMatchedRouteCache(
+    String requestId,
+    Map<String, dynamic> data,
+  ) async {
+    if (requestId.isEmpty) return;
+    await _matchedRouteCacheBox?.put(
+      requestId,
+      {
+        ...Map<String, dynamic>.from(data),
+        'cachedAt': DateTime.now().toIso8601String(),
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>?> getMatchedRouteCache(String requestId) async {
+    final row = _matchedRouteCacheBox?.get(requestId);
     if (row == null) return null;
     return Map<String, dynamic>.from(row);
   }

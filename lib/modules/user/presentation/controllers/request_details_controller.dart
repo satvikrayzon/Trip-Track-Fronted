@@ -13,11 +13,14 @@ import '../../../../core/di/service_locator.dart';
 import '../../../../core/network/models/api_result.dart';
 import '../../../../core/services/background_location_service.dart';
 import '../../../../core/services/location_permission_service.dart';
+import '../../../../core/services/map_matching_service.dart';
 import '../../../../core/services/punch_location_service.dart';
+import '../../../../core/services/punch_reminder_service.dart';
 import '../../../../core/services/sync_service.dart';
 import '../../../../core/services/tracking_coverage_service.dart';
 import '../../../../core/services/tracking_event_service.dart';
 import '../../../../core/services/tracking_session_service.dart';
+import '../../../travel/data/models/route_segment_model.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../features/tracking/data/services/trip_realtime_binder.dart';
 import '../../../../features/tracking/data/services/websocket_tracking_service.dart';
@@ -44,6 +47,9 @@ class RequestDetailsController {
   }) : _travelApi = travelApi ?? ServiceLocator.I.get() {
     _trackingSession = ServiceLocator.I.get<TrackingSessionService>();
     _punchLocation = ServiceLocator.I.get<PunchLocationService>();
+    if (ServiceLocator.I.has<PunchReminderService>()) {
+      _punchReminder = ServiceLocator.I.get<PunchReminderService>();
+    }
     _activeTripRestore = ActiveTripRestoreService(_travelApi);
     if (ServiceLocator.I.has<TrackingCoverageService>()) {
       _coverageService = ServiceLocator.I.get<TrackingCoverageService>();
@@ -51,6 +57,7 @@ class RequestDetailsController {
   }
 
   TrackingCoverageService? _coverageService;
+  PunchReminderService? _punchReminder;
 
   /// When set (e.g. GoRouter deep link), used instead of route arguments.
   final TravelRequestModel? initialRequest;
@@ -64,6 +71,7 @@ class RequestDetailsController {
   Timer? _adminLiveMapTimer;
   TripRealtimeBinder? _tripRealtime;
   StreamSubscription<Map<String, dynamic>>? _locationSub;
+  StreamSubscription<Map<String, dynamic>>? _routeMatchedSub;
   StreamSubscription<bool>? _connSubDetail;
 
   /// Stable business id (UUID) for Hive offline rows — not the Mongo `_id` URL segment.
@@ -84,6 +92,13 @@ class RequestDetailsController {
       ValueNotifier<TrackingCoverageResult?>(null);
   final ValueNotifier<bool> isCoverageLoading = ValueNotifier<bool>(false);
 
+  /// Live punch nudge (500m geofence). Backed by [PunchReminderService].
+  ValueNotifier<PunchReminderState?> get punchReminder =>
+      _punchReminder?.reminder ?? _emptyPunchReminder;
+
+  static final ValueNotifier<PunchReminderState?> _emptyPunchReminder =
+      ValueNotifier<PunchReminderState?>(null);
+
   void start() {
     final args = initialRequest ?? AppNavigation.arguments;
     if (args is! TravelRequestModel) {
@@ -93,7 +108,13 @@ class RequestDetailsController {
     _offlineRequestKey = resolved.requestId.isNotEmpty
         ? resolved.requestId
         : resolved.restResourceId;
+    request.addListener(_onRequestChangedForReminder);
     unawaited(_bootstrapRequest(resolved));
+  }
+
+  void _onRequestChangedForReminder() {
+    final trip = request.value;
+    if (trip != null) _syncPunchReminder(trip);
   }
 
   void dispose() {
@@ -103,8 +124,11 @@ class RequestDetailsController {
     _tripRealtime = null;
     _locationSub?.cancel();
     _locationSub = null;
+    _routeMatchedSub?.cancel();
+    _routeMatchedSub = null;
     _connSubDetail?.cancel();
     _connSubDetail = null;
+    request.removeListener(_onRequestChangedForReminder);
     if (request.value != null) {
       if (ServiceLocator.I.has<WebSocketTrackingService>()) {
         final ws = ServiceLocator.I.get<WebSocketTrackingService>();
@@ -119,6 +143,10 @@ class RequestDetailsController {
     adminLivePath.dispose();
     trackingCoverage.dispose();
     isCoverageLoading.dispose();
+  }
+
+  void _syncPunchReminder(TravelRequestModel trip) {
+    _punchReminder?.watch(trip);
   }
 
   Future<void> _bootstrapRequest(TravelRequestModel initialRequest) async {
@@ -165,9 +193,13 @@ class RequestDetailsController {
     }
 
     seed = await enhanceRequestWithRoadMetrics(seed);
+    seed = await _enhanceWithOfficialMatch(seed);
+    seed = seed.sanitizeAbsurdOfficialDistances();
     request.value = seed;
+    _syncPunchReminder(seed);
     _syncAdminLiveMapTimer(seed);
-    if (seed.status == AppConstants.statusReadyToStart) {
+    if (seed.status == AppConstants.statusReadyToStart ||
+        seed.nextPunchTypeForActiveLeg == 'travel_departure') {
       unawaited(_punchLocation.prewarm());
     }
     unawaited(_ensureMapCoordinates(seed));
@@ -175,6 +207,41 @@ class RequestDetailsController {
     final apiId =
         seed.requestId.isNotEmpty ? seed.requestId : _offlineRequestKey;
     _listenToRequestUpdates(apiId);
+    _listenToRouteMatched(apiId);
+  }
+
+  Future<TravelRequestModel> _enhanceWithOfficialMatch(
+    TravelRequestModel current,
+  ) async {
+    if (!ServiceLocator.I.has<MapMatchingService>()) return current;
+    try {
+      return await ServiceLocator.I
+          .get<MapMatchingService>()
+          .enhanceWithOfficialMatch(current);
+    } catch (_) {
+      return current;
+    }
+  }
+
+  void _listenToRouteMatched(String requestId) {
+    _routeMatchedSub?.cancel();
+    if (!ServiceLocator.I.has<WebSocketTrackingService>()) return;
+    if (!ServiceLocator.I.has<MapMatchingService>()) return;
+    final ws = ServiceLocator.I.get<WebSocketTrackingService>();
+    final matcher = ServiceLocator.I.get<MapMatchingService>();
+    _routeMatchedSub = ws.routeMatchedUpdates.listen((payload) async {
+      final match = MatchedRouteResult.fromMap(payload);
+      final id = match.requestId;
+      final current = request.value;
+      if (current == null) return;
+      final matches = id.isEmpty ||
+          id == current.requestId ||
+          id == current.restResourceId ||
+          id == requestId;
+      if (!matches) return;
+      final updated = await matcher.applyMatchToRequest(current, match);
+      request.value = updated;
+    });
   }
 
   Future<TravelRequestModel?> _readCachedRequest(String key) async {
@@ -282,16 +349,32 @@ class RequestDetailsController {
         if (lat != null && lng != null) {
           final latLng = LatLng(lat, lng);
           final currentPath = List<LatLng>.from(adminLivePath.value);
+          // Drop live teleports so the map cannot paint ocean lines.
+          if (currentPath.isNotEmpty) {
+            final prev = currentPath.last;
+            final jump = GeoUtils.distanceMeters(
+              prev.latitude,
+              prev.longitude,
+              lat,
+              lng,
+            );
+            if (jump > 2500) return;
+          }
           if (currentPath.isEmpty || currentPath.last != latLng) {
             currentPath.add(latLng);
             adminLivePath.value = currentPath;
 
             final currentRequest = request.value;
             if (currentRequest != null) {
-              final updatedRoutePoints = List<Map<String, dynamic>>.from(currentRequest.routePoints)
-                ..add(Map<String, dynamic>.from(payload));
-              request.value = currentRequest.copyWith(routePoints: updatedRoutePoints);
+              final updatedRoutePoints =
+                  List<Map<String, dynamic>>.from(currentRequest.routePoints)
+                    ..add(Map<String, dynamic>.from(payload));
+              request.value = currentRequest.copyWith(
+                routePoints: updatedRoutePoints,
+                routePointCount: updatedRoutePoints.length,
+              );
             }
+            evictRoutePointsCache(requestId);
           }
         }
       }
@@ -419,7 +502,9 @@ class RequestDetailsController {
     switch (result) {
       case ApiSuccess(:final data):
         final parsed = TravelRequestModel.fromMap(data);
-        final enhanced = await enhanceRequestWithRoadMetrics(parsed);
+        var enhanced = await enhanceRequestWithRoadMetrics(parsed);
+        enhanced = await _enhanceWithOfficialMatch(enhanced);
+        enhanced = enhanced.sanitizeAbsurdOfficialDistances();
         await _applyRemoteTrip(enhanced);
       case ApiFailure(:final failure):
         final cached = await _readCachedRequest(_offlineRequestKey);
@@ -699,6 +784,8 @@ class RequestDetailsController {
         );
 
         updatedRequest = await enhanceRequestWithRoadMetrics(updatedRequest);
+        updatedRequest = await _enhanceWithOfficialMatch(updatedRequest);
+        updatedRequest = updatedRequest.sanitizeAbsurdOfficialDistances();
         request.value = updatedRequest;
         await _hiveDb.saveTravelRequest(updatedRequest.toMap());
         await _activeTripRestore.pinActiveTrip(updatedRequest);
@@ -709,8 +796,24 @@ class RequestDetailsController {
           final leg = updatedRequest.activeLeg ?? activeLeg;
           if (leg.isReturnLeg) {
             unawaited(_trackingSession.endEntireTrip());
+            if (ServiceLocator.I.has<MapMatchingService>()) {
+              unawaited(
+                ServiceLocator.I.get<MapMatchingService>().triggerMatch(
+                      updatedRequest.restResourceId,
+                      reason: 'trip_end',
+                    ),
+              );
+            }
           } else {
             unawaited(_trackingSession.onTravelArrivalPaused());
+            if (ServiceLocator.I.has<MapMatchingService>()) {
+              unawaited(
+                ServiceLocator.I.get<MapMatchingService>().triggerMatch(
+                      updatedRequest.restResourceId,
+                      reason: 'incremental',
+                    ),
+              );
+            }
           }
         }
         if (live &&
@@ -935,12 +1038,14 @@ class RequestDetailsController {
             final next = legPoints[i];
 
             final timeDiff = next.timestamp.difference(prev.timestamp);
-            if (timeDiff > const Duration(minutes: 5) && GoogleMapsConfig.isConfigured) {
+            if (timeDiff > const Duration(minutes: 5) &&
+              GoogleMapsConfig.isConfigured) {
               final directDist = GeoUtils.distanceMeters(
                 prev.latitude, prev.longitude,
                 next.latitude, next.longitude,
               );
-              if (directDist > 150) {
+              // Cap gap-fill so teleports after app-kill cannot invent thousands of km.
+              if (directDist > 150 && directDist <= 2500) {
                 try {
                   final routes = await distanceService.fetchDrivingRoutesWithAlternatives(
                     originLatitude: prev.latitude,
@@ -1014,6 +1119,7 @@ class RequestDetailsController {
                 leg.routePolylineEncoded != encodedPolyline) {
               updatedLegs.add(leg.copyWith(
                 actualDistanceKmFromTrack: actualDistance,
+                provisionalDistanceKm: actualDistance,
                 routePolylineEncoded: encodedPolyline,
                 trackMovingDurationMinutes: legMetrics.movingMinutes,
                 trackStoppedDurationMinutes: legMetrics.stoppedMinutes,

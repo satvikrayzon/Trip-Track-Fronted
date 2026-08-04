@@ -8,6 +8,8 @@ import '../network/token_store.dart';
 import '../services/background_location_service.dart';
 import '../services/connectivity_service.dart';
 import '../services/punch_location_service.dart';
+import '../services/punch_reminder_service.dart';
+import '../services/map_matching_service.dart';
 import '../services/sync_service.dart';
 import '../services/tracking_coverage_service.dart';
 import '../services/tracking_event_service.dart';
@@ -39,6 +41,11 @@ void registerAppServices() {
 
   sl.lazy<PunchLocationService>(PunchLocationService.new);
 
+  sl.lazy<PunchReminderService>(() {
+    TrackingLifecycleBinder.instance.attach();
+    return PunchReminderService();
+  });
+
   sl.lazy<TrackingSessionService>(TrackingSessionService.new);
 
   sl.lazy<TrackingEventService>(() {
@@ -55,6 +62,10 @@ void registerAppServices() {
   sl.lazy<TrackingCoverageService>(() => TrackingCoverageService(
         travelApi: sl.get<TravelRequestRemoteDataSource>(),
         connectivity: sl.get<ConnectivityService>(),
+      ));
+
+  sl.lazy<MapMatchingService>(() => MapMatchingService(
+        travelApi: sl.get<TravelRequestRemoteDataSource>(),
       ));
 
   sl.lazy<SyncService>(() {

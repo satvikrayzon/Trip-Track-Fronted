@@ -11,6 +11,7 @@ import '../../../../core/network/failures/network_failure.dart';
 
 import '../../../../core/services/active_trip_restore_service.dart';
 import '../../../../core/services/background_location_service.dart';
+import '../../../../core/services/punch_reminder_service.dart';
 import '../../../../core/services/tracking_session_service.dart';
 
 import '../../../../core/utils/travel_request_debug_log.dart';
@@ -158,6 +159,17 @@ class UserHomeController {
     if (cachedActive != null) {
       activeTrip.value = cachedActive;
       _checkAndResumeTracking(cachedActive);
+      _syncPunchReminder(cachedActive);
+    }
+  }
+
+  void _syncPunchReminder(TravelRequestModel? trip) {
+    if (!ServiceLocator.I.has<PunchReminderService>()) return;
+    final reminders = ServiceLocator.I.get<PunchReminderService>();
+    if (trip == null) {
+      reminders.clear();
+    } else {
+      reminders.watch(trip);
     }
   }
 
@@ -219,7 +231,15 @@ class UserHomeController {
           completedRequests.value = completed;
         }
 
-        recentRequests.value = requests.take(5).toList();
+        final previousById = <String, TravelRequestModel>{
+          for (final r in recentRequests.value)
+            if (r.requestId.isNotEmpty) r.requestId: r,
+        };
+        recentRequests.value = requests.take(5).map((item) {
+          final prev = previousById[item.requestId];
+          if (prev == null) return item;
+          return item.mergePreservingLocalProgress(prev);
+        }).toList();
 
         if (requests.isNotEmpty) {
           await _syncHiveWithServer(userId, requests);
@@ -291,19 +311,20 @@ class UserHomeController {
 
     if (restored == null) {
       if (activeTrip.value != null) activeTrip.value = null;
-
+      _syncPunchReminder(null);
       return;
     }
 
     activeTrip.value = restored;
     _checkAndResumeTracking(restored);
+    _syncPunchReminder(restored);
 
     final list = List<TravelRequestModel>.from(recentRequests.value);
 
     final index = list.indexWhere((r) => r.requestId == restored.requestId);
 
     if (index != -1) {
-      list[index] = restored;
+      list[index] = restored.mergePreservingLocalProgress(list[index]);
       recentRequests.value = list;
     }
   }
@@ -375,11 +396,15 @@ class UserHomeController {
     if (updatedRequest.userId != _authController.currentUserApiId) return;
 
     if (activeTrip.value?.requestId == updatedRequest.requestId) {
-      if (updatedRequest.status == 'Completed' &&
-          !updatedRequest.needsReturnArrivalPunch) {
+      final mergedActive =
+          updatedRequest.mergePreservingLocalProgress(activeTrip.value!);
+      if (mergedActive.status == 'Completed' &&
+          !mergedActive.needsReturnArrivalPunch) {
         activeTrip.value = null;
+        _syncPunchReminder(null);
       } else {
-        activeTrip.value = updatedRequest;
+        activeTrip.value = mergedActive;
+        _syncPunchReminder(mergedActive);
       }
     } else if (updatedRequest.status != 'Completed' &&
         updatedRequest.status != 'Cancelled' &&
@@ -389,8 +414,16 @@ class UserHomeController {
       if (status == 'Travelling' ||
           status == 'Returning' ||
           status == 'In Meeting' ||
-          status == 'At Client') {
-        activeTrip.value = updatedRequest;
+          status == 'At Client' ||
+          status == 'Ready To Start' ||
+          status == 'Ready For Next' ||
+          status == 'Ready To Return') {
+        final seed = activeTrip.value;
+        final mergedActive = seed != null
+            ? updatedRequest.mergePreservingLocalProgress(seed)
+            : updatedRequest;
+        activeTrip.value = mergedActive;
+        _syncPunchReminder(mergedActive);
       }
     }
 
@@ -406,10 +439,14 @@ class UserHomeController {
 
     if (index != -1) {
       final oldRequest = list[index];
-      list[index] = updatedRequest;
+      // Merge so partial WS / details payloads don't wipe card fields
+      // (fuel, meetings, duration, vehicle, allowance, etc.).
+      final merged =
+          updatedRequest.mergePreservingLocalProgress(oldRequest);
+      list[index] = merged;
       recentRequests.value = list;
 
-      if (oldRequest.status != updatedRequest.status) {
+      if (oldRequest.status != merged.status) {
         if (oldRequest.status == 'Completed') {
           completedRequests.value =
               (completedRequests.value - 1).clamp(0, 999999);
@@ -417,7 +454,7 @@ class UserHomeController {
           pendingRequests.value = (pendingRequests.value - 1).clamp(0, 999999);
         }
 
-        if (updatedRequest.status == 'Completed') {
+        if (merged.status == 'Completed') {
           completedRequests.value++;
         } else {
           pendingRequests.value++;

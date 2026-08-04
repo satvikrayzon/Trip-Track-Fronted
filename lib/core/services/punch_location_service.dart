@@ -113,14 +113,11 @@ class PunchLocationService {
     return _resolveCoordinatesForAddress(from);
   }
 
-  /// Returns `null` when allowed; otherwise a user-facing error message.
-  Future<String?> departureGeofenceError({
+  /// Anchor used for the 500m Start Departure geofence.
+  Future<Map<String, double>?> resolveDepartureAnchor({
     required TravelRequestModel request,
-    required double userLat,
-    required double userLng,
     TripLegModel? activeLeg,
   }) async {
-    if (bypassGeofenceChecks) return null;
     final leg = activeLeg ?? request.activeLeg;
     Map<String, double>? start;
 
@@ -144,6 +141,22 @@ class PunchLocationService {
       }
     }
     start ??= await resolveStartCoordinates(request);
+    return start;
+  }
+
+  /// Returns `null` when allowed; otherwise a user-facing error message.
+  Future<String?> departureGeofenceError({
+    required TravelRequestModel request,
+    required double userLat,
+    required double userLng,
+    TripLegModel? activeLeg,
+  }) async {
+    if (bypassGeofenceChecks) return null;
+    final leg = activeLeg ?? request.activeLeg;
+    final start = await resolveDepartureAnchor(
+      request: request,
+      activeLeg: leg,
+    );
     if (start == null) {
       return 'Could not verify the starting location. '
           'Edit this request and re-select the from location on the map.';
@@ -168,8 +181,9 @@ class PunchLocationService {
             leg.fromLocation.trim().isNotEmpty
         ? leg.fromLocation
         : request.fromLocation;
-    return 'Start Departure only within ${allowed}m of '
-        '$originLabel. You are about ${away}m away.';
+    return 'Start Departure only within ${allowed}m of $originLabel. '
+        'You are about ${away}m away — return to that location to punch. '
+        'Travel before Start Departure is not counted.';
   }
 
   Future<Map<String, double>?> _resolveCoordinatesForAddress(
@@ -387,7 +401,8 @@ class PunchLocationService {
         ? leg.toLocation
         : request.toLocation;
     return 'Mark Arrival only within ${allowed}m of $label. '
-        'You are about ${away}m away.';
+        'You are about ${away}m away — return to that location to punch. '
+        'GPS keeps tracking until you mark arrival.';
   }
 
   void _remember(Position position) {
