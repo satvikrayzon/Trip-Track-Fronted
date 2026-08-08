@@ -216,10 +216,15 @@ class TrackAnalytics {
     GpsTrackingConfig? config,
   }) {
     final legPoints = points
-        .where((p) =>
-            p.legId == legId &&
-            !p.timestamp.isBefore(startInclusive) &&
-            !p.timestamp.isAfter(endInclusive))
+        .where((p) {
+          // Allow empty legId — callers often pass a time-scoped trail where
+          // points were not tagged (undercounting caused 17.8 vs ~20.5).
+          final legOk =
+              legId.isEmpty || p.legId.isEmpty || p.legId == legId;
+          return legOk &&
+              !p.timestamp.isBefore(startInclusive) &&
+              !p.timestamp.isAfter(endInclusive);
+        })
         .toList()
       ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
 

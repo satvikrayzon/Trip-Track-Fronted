@@ -163,18 +163,29 @@ class UserRequestsController {
 
           _allMine.sort((a, b) => b.requestDate.compareTo(a.requestDate));
 
-          if (ServiceLocator.I.has<TripRoadMetricsService>()) {
-            _allMine = await ServiceLocator.I
-                .get<TripRoadMetricsService>()
-                .enhanceAll(_allMine);
-            if (reset && _allMine.isNotEmpty) {
-              await _syncHiveWithServer(userId, _allMine);
-            }
-          }
-
           hasMore.value = data.hasMore;
           if (data.hasMore) _page++;
+          // Paint list first — enhance missing km in background (no Snap-all).
           _applyFilters();
+
+          if (ServiceLocator.I.has<TripRoadMetricsService>()) {
+            unawaited(() async {
+              try {
+                final enhanced = await ServiceLocator.I
+                    .get<TripRoadMetricsService>()
+                    .enhanceAll(
+                      _allMine,
+                      persist: true,
+                      syncFromTrack: false,
+                    );
+                _allMine = enhanced;
+                if (reset && _allMine.isNotEmpty) {
+                  await _syncHiveWithServer(userId, _allMine);
+                }
+                _applyFilters();
+              } catch (_) {}
+            }());
+          }
         case ApiFailure(:final failure):
           if (reset && _allMine.isEmpty) {
             _allMine = _modelsFromHive(await _hiveIndexForUser(userId));

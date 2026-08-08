@@ -48,11 +48,18 @@ class RoadAlignedRouteService {
   final DistanceService _distance;
 
   /// Align chronological GPS samples onto the road network.
+  ///
+  /// [anchorStart] / [anchorEnd] — departure / arrival punches. Leading Snap
+  /// spurs before the real punch are trimmed so the trail starts where the
+  /// user actually started.
   Future<RoadAlignedRoute> align({
     required List<GpsGapInputPoint> gpsPoints,
+    LatLng? anchorStart,
+    LatLng? anchorEnd,
   }) async {
     _roadAlignLog(
-      'align() START build=v7-kill-gap-roads gps=${gpsPoints.length}',
+      'align() START build=v8-punch-anchor gps=${gpsPoints.length} '
+      'startAnchor=${anchorStart != null} endAnchor=${anchorEnd != null}',
     );
 
     if (gpsPoints.length < 2) {
@@ -64,8 +71,15 @@ class RoadAlignedRouteService {
       );
     }
 
-    final cleaned = GpsGapRoadFill.stripSpikePoints(
-      GpsGapRoadFill.collapseDuplicateFillerRuns(gpsPoints),
+    var working = gpsPoints;
+    if (anchorStart != null) {
+      working = trimGpsLeadingAwayFromAnchor(working, anchorStart);
+    }
+
+    final cleaned = GpsGapRoadFill.stripDetourLoops(
+      GpsGapRoadFill.stripSpikePoints(
+        GpsGapRoadFill.collapseDuplicateFillerRuns(working),
+      ),
     );
     final spaced = <GpsGapInputPoint>[];
     for (final p in cleaned) {
@@ -94,7 +108,13 @@ class RoadAlignedRouteService {
     }
 
     final local = await _alignLocally(spaced);
-    final cleanedPts = _stripLatLngBacktracks(local.points);
+    var cleanedPts = _stripLatLngSpikesAndBacktracks(local.points);
+    cleanedPts = stripDetourLoops(cleanedPts);
+    cleanedPts = anchorPathToPunches(
+      cleanedPts,
+      start: anchorStart,
+      end: anchorEnd,
+    );
     final result = cleanedPts.length >= 2
         ? RoadAlignedRoute(
             points: cleanedPts,
@@ -111,52 +131,363 @@ class RoadAlignedRouteService {
     return result;
   }
 
-  /// Remove A→B→back-toward-A scribble from the painted polyline.
-  List<LatLng> _stripLatLngBacktracks(List<LatLng> points) {
+  /// Drop GPS samples that wander far from [anchor] before the trail first
+  /// approaches it (false "start west of office" spurs).
+  static List<GpsGapInputPoint> trimGpsLeadingAwayFromAnchor(
+    List<GpsGapInputPoint> points,
+    LatLng anchor, {
+    double nearMeters = 100,
+  }) {
     if (points.length < 3) return points;
-    final out = <LatLng>[points.first];
-    for (var i = 1; i < points.length; i++) {
-      final next = points[i];
-      while (out.length >= 2) {
-        final a = out[out.length - 2];
-        final b = out.last;
-        final dAB = GeoUtils.distanceMeters(
-          a.latitude,
-          a.longitude,
-          b.latitude,
-          b.longitude,
-        );
-        final dAN = GeoUtils.distanceMeters(
-          a.latitude,
-          a.longitude,
-          next.latitude,
-          next.longitude,
-        );
-        final dBN = GeoUtils.distanceMeters(
-          b.latitude,
-          b.longitude,
-          next.latitude,
-          next.longitude,
-        );
-        if (dAB >= 30 && dBN >= 20 && dAN < dAB * 0.55 && dAN < dBN) {
-          out.removeLast();
-          continue;
-        }
+
+    var firstNear = -1;
+    for (var i = 0; i < points.length; i++) {
+      final d = GeoUtils.distanceMeters(
+        points[i].lat,
+        points[i].lng,
+        anchor.latitude,
+        anchor.longitude,
+      );
+      if (d <= nearMeters) {
+        firstNear = i;
         break;
       }
-      if (out.isNotEmpty) {
-        final prev = out.last;
+    }
+
+    if (firstNear < 0) {
+      // No sample near punch — use closest in the first 40% of the trail.
+      var bestI = 0;
+      var bestD = double.infinity;
+      final limit = (points.length * 0.4).ceil().clamp(3, points.length);
+      for (var i = 0; i < limit; i++) {
         final d = GeoUtils.distanceMeters(
+          points[i].lat,
+          points[i].lng,
+          anchor.latitude,
+          anchor.longitude,
+        );
+        if (d < bestD) {
+          bestD = d;
+          bestI = i;
+        }
+      }
+      if (bestD > 450) return points;
+      firstNear = bestI;
+    }
+
+    if (firstNear <= 0) {
+      return points;
+    }
+
+    final d0 = GeoUtils.distanceMeters(
+      points.first.lat,
+      points.first.lng,
+      anchor.latitude,
+      anchor.longitude,
+    );
+    if (d0 <= nearMeters) return points;
+
+    _roadAlignLog(
+      'trimGpsLeading: drop $firstNear pts before punch '
+      '(first was ${d0.toStringAsFixed(0)}m away)',
+    );
+    final anchorPt = GpsGapInputPoint(
+      lat: anchor.latitude,
+      lng: anchor.longitude,
+      time: points[firstNear].time,
+      source: 'punch_start',
+    );
+    return [anchorPt, ...points.sublist(firstNear)];
+  }
+
+  /// Force painted path to begin/end on punch pins; drop leading Snap spurs.
+  static List<LatLng> anchorPathToPunches(
+    List<LatLng> path, {
+    LatLng? start,
+    LatLng? end,
+    double nearMeters = 100,
+  }) {
+    if (path.length < 2) return path;
+    var out = List<LatLng>.from(path);
+
+    if (start != null) {
+      var firstNear = -1;
+      for (var i = 0; i < out.length; i++) {
+        final d = GeoUtils.distanceMeters(
+          out[i].latitude,
+          out[i].longitude,
+          start.latitude,
+          start.longitude,
+        );
+        if (d <= nearMeters) {
+          firstNear = i;
+          break;
+        }
+      }
+      if (firstNear < 0) {
+        var bestI = 0;
+        var bestD = double.infinity;
+        final limit = (out.length * 0.4).ceil().clamp(3, out.length);
+        for (var i = 0; i < limit; i++) {
+          final d = GeoUtils.distanceMeters(
+            out[i].latitude,
+            out[i].longitude,
+            start.latitude,
+            start.longitude,
+          );
+          if (d < bestD) {
+            bestD = d;
+            bestI = i;
+          }
+        }
+        if (bestD <= 450) firstNear = bestI;
+      }
+
+      if (firstNear > 0) {
+        final d0 = GeoUtils.distanceMeters(
+          out.first.latitude,
+          out.first.longitude,
+          start.latitude,
+          start.longitude,
+        );
+        if (d0 > nearMeters) {
+          out = out.sublist(firstNear);
+        }
+      }
+
+      if (out.isEmpty ||
+          GeoUtils.distanceMeters(
+                out.first.latitude,
+                out.first.longitude,
+                start.latitude,
+                start.longitude,
+              ) >
+              25) {
+        out = [start, ...out];
+      } else {
+        out[0] = start;
+      }
+    }
+
+    if (end != null && out.length >= 2) {
+      var lastNear = -1;
+      for (var i = out.length - 1; i >= 0; i--) {
+        final d = GeoUtils.distanceMeters(
+          out[i].latitude,
+          out[i].longitude,
+          end.latitude,
+          end.longitude,
+        );
+        if (d <= nearMeters) {
+          lastNear = i;
+          break;
+        }
+      }
+      if (lastNear >= 0 && lastNear < out.length - 1) {
+        final dLast = GeoUtils.distanceMeters(
+          out.last.latitude,
+          out.last.longitude,
+          end.latitude,
+          end.longitude,
+        );
+        if (dLast > nearMeters) {
+          out = out.sublist(0, lastNear + 1);
+        }
+      }
+      if (GeoUtils.distanceMeters(
+            out.last.latitude,
+            out.last.longitude,
+            end.latitude,
+            end.longitude,
+          ) >
+          25) {
+        out = [...out, end];
+      } else {
+        out[out.length - 1] = end;
+      }
+    }
+
+    return out;
+  }
+
+  /// Remove side-street rectangular loops that leave the corridor and return
+  /// near the same junction (Snap noise / GPS scribble into bungalows).
+  ///
+  /// If path length i→j is long but chord i→j is short, drop i+1…j−1 so the
+  /// trail stays on the main road (the "black" route, not the yellow detour).
+  static List<LatLng> stripDetourLoops(
+    List<LatLng> points, {
+    double maxReturnChordMeters = 75,
+    double minLoopPathMeters = 100,
+    double minPathVsChordRatio = 2.6,
+    double maxLoopPathMeters = 2200,
+  }) {
+    if (points.length < 5) return points;
+    var work = List<LatLng>.from(points);
+
+    for (var pass = 0; pass < 5; pass++) {
+      int? bestI;
+      int? bestJ;
+      var bestPath = 0.0;
+
+      for (var i = 0; i < work.length - 4; i++) {
+        var pathFromI = 0.0;
+        for (var j = i + 1; j < work.length; j++) {
+          pathFromI += GeoUtils.distanceMeters(
+            work[j - 1].latitude,
+            work[j - 1].longitude,
+            work[j].latitude,
+            work[j].longitude,
+          );
+          if (pathFromI > maxLoopPathMeters) break;
+          if (j < i + 3) continue;
+          if (pathFromI < minLoopPathMeters) continue;
+
+          final chord = GeoUtils.distanceMeters(
+            work[i].latitude,
+            work[i].longitude,
+            work[j].latitude,
+            work[j].longitude,
+          );
+          if (chord > maxReturnChordMeters) continue;
+
+          final isLoop = chord <= 30
+              ? pathFromI >= minLoopPathMeters
+              : pathFromI >= chord * minPathVsChordRatio;
+          if (!isLoop) continue;
+
+          if (pathFromI > bestPath) {
+            bestPath = pathFromI;
+            bestI = i;
+            bestJ = j;
+          }
+        }
+      }
+
+      if (bestI == null || bestJ == null || bestJ <= bestI + 1) break;
+
+      _roadAlignLog(
+        'stripDetourLoops: remove ${bestJ - bestI - 1} pts '
+        '(${bestPath.toStringAsFixed(0)}m loop, return chord '
+        '${GeoUtils.distanceMeters(work[bestI].latitude, work[bestI].longitude, work[bestJ].latitude, work[bestJ].longitude).toStringAsFixed(0)}m)',
+      );
+
+      final next = <LatLng>[
+        ...work.sublist(0, bestI + 1),
+        ...work.sublist(bestJ),
+      ];
+      // Collapse near-duplicate junction after cut.
+      if (next.length > bestI + 1) {
+        final d = GeoUtils.distanceMeters(
+          next[bestI].latitude,
+          next[bestI].longitude,
+          next[bestI + 1].latitude,
+          next[bestI + 1].longitude,
+        );
+        if (d < 18) next.removeAt(bestI + 1);
+      }
+      if (next.length >= work.length) break;
+      work = next;
+    }
+
+    return work;
+  }
+
+  /// Drop V-spikes and A→B→back-toward-A scribble from the painted polyline.
+  List<LatLng> _stripLatLngSpikesAndBacktracks(List<LatLng> points) {
+    if (points.length < 3) return points;
+    var work = List<LatLng>.from(points);
+    for (var pass = 0; pass < 3; pass++) {
+      final spiked = <LatLng>[work.first];
+      for (var i = 1; i < work.length - 1; i++) {
+        final prev = spiked.last;
+        final mid = work[i];
+        final next = work[i + 1];
+        final dPrev = GeoUtils.distanceMeters(
+          prev.latitude,
+          prev.longitude,
+          mid.latitude,
+          mid.longitude,
+        );
+        final dNext = GeoUtils.distanceMeters(
+          mid.latitude,
+          mid.longitude,
+          next.latitude,
+          next.longitude,
+        );
+        final dSkip = GeoUtils.distanceMeters(
           prev.latitude,
           prev.longitude,
           next.latitude,
           next.longitude,
         );
-        if (d < 10) continue;
+        if (dPrev > 40 &&
+            dNext > 40 &&
+            dSkip < 120 &&
+            dSkip < dPrev * 0.55 &&
+            dSkip < dNext * 0.55) {
+          continue;
+        }
+        // Long thin V (map end-spike / wrong-way spur).
+        if (dPrev > 80 &&
+            dNext > 80 &&
+            dSkip < dPrev * 0.35 &&
+            dSkip < dNext * 0.35) {
+          continue;
+        }
+        spiked.add(mid);
       }
-      out.add(next);
+      spiked.add(work.last);
+
+      final out = <LatLng>[spiked.first];
+      for (var i = 1; i < spiked.length; i++) {
+        final next = spiked[i];
+        while (out.length >= 2) {
+          final a = out[out.length - 2];
+          final b = out.last;
+          final dAB = GeoUtils.distanceMeters(
+            a.latitude,
+            a.longitude,
+            b.latitude,
+            b.longitude,
+          );
+          final dAN = GeoUtils.distanceMeters(
+            a.latitude,
+            a.longitude,
+            next.latitude,
+            next.longitude,
+          );
+          final dBN = GeoUtils.distanceMeters(
+            b.latitude,
+            b.longitude,
+            next.latitude,
+            next.longitude,
+          );
+          if (dAB >= 20 && dBN >= 12 && dAN < dAB * 0.6 && dAN < dBN) {
+            out.removeLast();
+            continue;
+          }
+          break;
+        }
+        if (out.isNotEmpty) {
+          final prev = out.last;
+          final d = GeoUtils.distanceMeters(
+            prev.latitude,
+            prev.longitude,
+            next.latitude,
+            next.longitude,
+          );
+          if (d < 10) continue;
+        }
+        out.add(next);
+      }
+      if (out.length >= work.length) {
+        work = out;
+        break;
+      }
+      work = out;
     }
-    return out;
+    return work;
   }
 
   Future<RoadAlignedRoute> _alignLocally(List<GpsGapInputPoint> points) async {

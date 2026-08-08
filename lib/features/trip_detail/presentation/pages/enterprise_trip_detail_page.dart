@@ -285,8 +285,9 @@ class _MetricsRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final dist =
-        trip.totalDistanceKm > 0 ? trip.totalDistanceKm : (trip.distance ?? 0);
+    final dist = trip.effectiveDistanceKm > 0
+        ? trip.effectiveDistanceKm
+        : (trip.distance ?? 0);
     final travel = trip.totalTravelDurationMinutes;
     final meeting = trip.totalMeetingDurationMinutes;
     return Row(

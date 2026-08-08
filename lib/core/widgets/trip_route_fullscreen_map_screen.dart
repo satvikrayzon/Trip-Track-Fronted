@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import '../utils/google_map_controller_utils.dart';
 import '../utils/geo_utils.dart';
+import '../utils/map_marker_icon.dart';
 import '../utils/route_point_simplify.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text_styles.dart';
@@ -536,9 +537,26 @@ class _TripRouteFullscreenMapScreenState
     LatLng? startPos;
     LatLng? endPos;
 
+    final status = widget.request.status.trim();
+    final endIsLiveTip = status == 'Travelling' ||
+        status == 'Returning' ||
+        status == 'At Client' ||
+        status == 'In Meeting';
+
     if (pts.isNotEmpty) {
-      startPos = pts.first;
-      endPos = pts.length > 1 ? pts.last : null;
+      startPos = tripMapStartMarkerTarget(
+            widget.request,
+            pathFirst: pts.first,
+          ) ??
+          pts.first;
+      endPos = pts.length > 1
+          ? (tripMapEndMarkerTarget(
+                widget.request,
+                pathLast: pts.last,
+                isLive: endIsLiveTip,
+              ) ??
+              pts.last)
+          : null;
     }
 
     if (tabIndex > 0) {
@@ -548,11 +566,11 @@ class _TripRouteFullscreenMapScreenState
         startTitle = 'Start: ${leg.fromLocation}';
         endTitle = 'End: ${leg.toLocation}';
 
-        if (startPos == null && leg.departurePunch != null) {
+        if (leg.departurePunch != null) {
           startPos = LatLng(
               leg.departurePunch!.latitude, leg.departurePunch!.longitude);
         }
-        if (endPos == null && leg.arrivalPunch != null) {
+        if (leg.arrivalPunch != null) {
           endPos =
               LatLng(leg.arrivalPunch!.latitude, leg.arrivalPunch!.longitude);
         }
@@ -565,22 +583,85 @@ class _TripRouteFullscreenMapScreenState
 
     if (startPos == null) return {};
 
+    // Whole-route live: tip follows GPS trail.
+    if (tabIndex == 0 && endIsLiveTip && pts.length > 1) {
+      endPos = pts.last;
+    }
+
     return {
       Marker(
         markerId: const MarkerId('t_start'),
         position: startPos,
-        icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueRed),
+        icon: mapStartMarkerIcon,
+        anchor: const Offset(0.5, 1.0),
         infoWindow: InfoWindow(title: startTitle),
       ),
       if (endPos != null && endPos != startPos)
         Marker(
           markerId: const MarkerId('t_end'),
           position: endPos,
-          icon:
-              BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure),
-          infoWindow: InfoWindow(title: endTitle),
+          icon: endIsLiveTip ? mapLiveMarkerIcon : mapEndMarkerIcon,
+          anchor: const Offset(0.5, 1.0),
+          infoWindow: InfoWindow(
+            title: endIsLiveTip ? 'Current location' : endTitle,
+          ),
         ),
+      // Whole-route tab: show all client stops. Per-leg tab: only that stop.
+      ..._stopMarkersForTab(tabIndex, startPos, endPos),
     };
+  }
+
+  Set<Marker> _stopMarkersForTab(
+    int tabIndex,
+    LatLng startPos,
+    LatLng? endPos,
+  ) {
+    if (tabIndex > 0) {
+      // Single-leg view: mark this leg's client arrival as Stop when useful.
+      final legIndex = tabIndex - 1;
+      if (legIndex < 0 || legIndex >= widget.request.tripLegs.length) {
+        return {};
+      }
+      final leg = widget.request.tripLegs[legIndex];
+      if (leg.isReturnLeg) return {};
+      final punch = leg.arrivalPunch ?? leg.meetingStartPunch;
+      if (punch == null) return {};
+      if (punch.latitude.abs() < 1e-6 && punch.longitude.abs() < 1e-6) {
+        return {};
+      }
+      final pos = LatLng(punch.latitude, punch.longitude);
+      // Don't stack on start/end pins.
+      final exclude = [startPos, if (endPos != null) endPos];
+      for (final e in exclude) {
+        final d = GeoUtils.distanceMeters(
+          pos.latitude,
+          pos.longitude,
+          e.latitude,
+          e.longitude,
+        );
+        if (d < 35) return {};
+      }
+      final name = leg.clientName.trim().isNotEmpty
+          ? leg.clientName.trim()
+          : leg.toLocation;
+      return {
+        Marker(
+          markerId: MarkerId('leg_stop_$legIndex'),
+          position: pos,
+          icon: mapStopMarkerIcon,
+          anchor: const Offset(0.5, 1.0),
+          infoWindow: InfoWindow(title: 'Stop', snippet: name),
+        ),
+      };
+    }
+
+    return tripStopMarkers(
+      widget.request,
+      exclude: [
+        startPos,
+        if (endPos != null) endPos,
+      ],
+    );
   }
 
   @override
@@ -614,7 +695,7 @@ class _TripRouteFullscreenMapScreenState
       body: _tabCount > 1
           ? TabBarView(
               controller: _tabs,
-              physics: NeverScrollableScrollPhysics(),
+              physics: const NeverScrollableScrollPhysics(),
               children: List.generate(_tabCount, (index) {
                 final markers = _traveledMarkers(index);
                 final pts = _pointsForTab(index);
@@ -691,6 +772,8 @@ class _TripRouteFullscreenMapScreenState
                     ? [markers.first.position]
                     : [initialTarget]),
             height: null,
+            stopPoints:
+                tripMapStops(widget.request).map((s) => s.position).toList(),
           ),
           builder: (context) => GoogleMap(
             key: ValueKey('fs_map_${widget.request.requestId}'),

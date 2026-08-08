@@ -16,7 +16,6 @@ import '../../../../core/services/tracking_session_service.dart';
 import '../../../../core/services/trip_road_metrics_service.dart';
 
 import '../../../../core/utils/travel_request_debug_log.dart';
-import '../../../../core/utils/app_debug_log.dart';
 
 import '../../../auth/presentation/controllers/app_auth_controller.dart';
 
@@ -218,24 +217,21 @@ class UserHomeController {
 
         requests.sort((a, b) => b.requestDate.compareTo(a.requestDate));
 
-        // Recompute GPS km + allowance so cards match detail route (not stale API).
-        List<TravelRequestModel> enhanced = requests;
-        if (ServiceLocator.I.has<TripRoadMetricsService>()) {
-          enhanced = await ServiceLocator.I
-              .get<TripRoadMetricsService>()
-              .enhanceAll(requests.take(10).toList());
-          // Keep rest of page unenhanced if list was longer than 10.
-          if (requests.length > enhanced.length) {
-            enhanced = [...enhanced, ...requests.skip(enhanced.length)];
-          }
-        }
+        // Show cards immediately — never block home on Snap/Directions.
+        final ready = requests
+            .map(
+              (r) => r
+                  .sanitizeAbsurdOfficialDistances()
+                  .withRecalculatedSummary(),
+            )
+            .toList();
 
         if (summaryResult is! ApiSuccess) {
           final pending = data.pending ??
-              enhanced.where((r) => r.status != 'Completed').length;
+              ready.where((r) => r.status != 'Completed').length;
 
           final completed = data.completed ??
-              enhanced.where((r) => r.status == 'Completed').length;
+              ready.where((r) => r.status == 'Completed').length;
 
           totalRequests.value = data.total;
 
@@ -248,14 +244,17 @@ class UserHomeController {
           for (final r in recentRequests.value)
             if (r.requestId.isNotEmpty) r.requestId: r,
         };
-        recentRequests.value = enhanced.take(5).map((item) {
+        recentRequests.value = ready.take(5).map((item) {
           final prev = previousById[item.requestId];
           if (prev == null) return item;
           return item.mergePreservingLocalProgress(prev);
         }).toList();
 
-        if (enhanced.isNotEmpty) {
-          await _syncHiveWithServer(userId, enhanced);
+        // Fill missing km in background only (no full-track re-align on home).
+        unawaited(_enhanceRecentInBackground(userId, ready));
+
+        if (ready.isNotEmpty) {
+          await _syncHiveWithServer(userId, ready);
         }
 
         unawaited(_refreshActiveTripInBackground());
@@ -273,6 +272,42 @@ class UserHomeController {
         if (recentRequests.value.isEmpty) {
           await _loadRecentFromHiveFallback(userId);
         }
+    }
+  }
+
+  /// Soft km fill after cards are visible — never blocks first paint.
+  Future<void> _enhanceRecentInBackground(
+    String userId,
+    List<TravelRequestModel> ready,
+  ) async {
+    if (!ServiceLocator.I.has<TripRoadMetricsService>()) return;
+    try {
+      final enhanced = await ServiceLocator.I
+          .get<TripRoadMetricsService>()
+          .enhanceAll(
+            ready.take(10).toList(),
+            persist: true,
+            // Home should not Snap every trip; only fill when km is missing.
+            syncFromTrack: false,
+          );
+      if (enhanced.isEmpty) return;
+
+      final byId = {
+        for (final r in enhanced)
+          if (r.requestId.isNotEmpty) r.requestId: r,
+      };
+      recentRequests.value = recentRequests.value.map((item) {
+        final next = byId[item.requestId];
+        if (next == null) return item;
+        return next.mergePreservingLocalProgress(item);
+      }).toList();
+
+      await _syncHiveWithServer(userId, [
+        ...enhanced,
+        ...ready.skip(enhanced.length),
+      ]);
+    } catch (_) {
+      // Background only — home already painted.
     }
   }
 

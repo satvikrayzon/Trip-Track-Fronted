@@ -78,6 +78,20 @@ void main() {
       expect(cleaned[0].lat, 21.1700);
       expect(cleaned[1].lat, 21.1701);
     });
+
+    test('drops long thin out-and-back spike', () {
+      final points = [
+        const GpsGapInputPoint(lat: 21.1700, lng: 72.8300, source: 'gps'),
+        // ~250m north
+        const GpsGapInputPoint(lat: 21.1722, lng: 72.8300, source: 'gps'),
+        // return almost to start (~30m offset)
+        const GpsGapInputPoint(lat: 21.1702, lng: 72.8301, source: 'gps'),
+      ];
+      final cleaned = GpsGapRoadFill.stripSpikePoints(points);
+      expect(cleaned.length, lessThan(points.length));
+      expect(cleaned.first.lat, 21.1700);
+      expect(cleaned.last.lat, 21.1702);
+    });
   });
 
   group('GpsGapRoadFill.collapseDuplicateFillerRuns', () {

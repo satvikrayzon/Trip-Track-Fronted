@@ -1,8 +1,10 @@
 import 'package:excel/excel.dart';
 import 'package:intl/intl.dart';
 
+import '../../../../core/di/service_locator.dart';
 import '../../../../core/network/models/api_result.dart';
 import '../../../../core/services/file_download_service.dart';
+import '../../../../core/services/trip_road_metrics_service.dart';
 import '../../travel/data/datasources/travel_request_remote_datasource.dart';
 import '../../travel/data/models/travel_request_model.dart';
 import '../../travel/data/models/travel_request_list_result.dart';
@@ -58,7 +60,20 @@ class AdminReportService {
     // Sort by date ascending
     filtered.sort((a, b) => a.requestDate.compareTo(b.requestDate));
 
-    await generateExcelFile(filtered);
+    // Fill missing GPS km from route points so Excel matches cards without
+    // opening each trip detail. Already-stored provisional km is left alone.
+    var forExport = filtered
+        .map((r) => r
+            .sanitizeAbsurdOfficialDistances()
+            .withRecalculatedSummary())
+        .toList();
+    if (ServiceLocator.I.has<TripRoadMetricsService>()) {
+      forExport = await ServiceLocator.I
+          .get<TripRoadMetricsService>()
+          .enhanceAll(forExport, persist: true, syncFromTrack: true);
+    }
+
+    await generateExcelFile(forExport);
   }
 
   Future<void> generateExcelFile(List<TravelRequestModel> requests) async {
@@ -93,7 +108,9 @@ class AdminReportService {
     int srNo = 1;
     for (final req in requests) {
       final r = req.withRecalculatedSummary();
-      final dist = r.totalDistanceKm > 0 ? r.totalDistanceKm : (r.distance ?? 0.0);
+      final dist = r.effectiveDistanceKm > 0
+          ? r.effectiveDistanceKm
+          : (r.distance ?? 0.0);
       
       final gpsMissingTime = r.totalTravelDurationMinutes > 0
           ? (r.totalTravelDurationMinutes - (r.totalMovingMinutesFromTrack + r.totalStoppedMinutesFromTrack)).clamp(0, r.totalTravelDurationMinutes)

@@ -23,6 +23,7 @@ import '../../../travel/services/travel_request_delete_service.dart';
 import '../../../travel/utils/travel_request_delete_utils.dart';
 import '../../../../features/tracking/data/services/trip_realtime_binder.dart';
 import '../../../../core/widgets/trip_route_map_data.dart';
+import '../../../../core/services/trip_road_metrics_service.dart';
 
 
 
@@ -148,8 +149,13 @@ class AdminTravelRequestsController {
           final prev = previousByKey[item.requestId] ??
               previousByKey[item.restResourceId] ??
               (item.tripId.isNotEmpty ? previousByKey[item.tripId] : null);
-          if (prev == null) return item.ensureTripLegs();
-          return item.mergePreservingLocalProgress(prev).ensureTripLegs();
+          final base = prev == null
+              ? item.ensureTripLegs()
+              : item.mergePreservingLocalProgress(prev).ensureTripLegs();
+          // Same km formula as user cards (prefer GPS/sane legs over Nest total).
+          return base
+              .sanitizeAbsurdOfficialDistances()
+              .withRecalculatedSummary();
         }).toList();
         _allRequests.sort((a, b) => b.requestDate.compareTo(a.requestDate));
 
@@ -178,6 +184,11 @@ class AdminTravelRequestsController {
           }
 
         _applyFilters();
+        // Full reload: sync from GPS trail and PATCH so admin matches user.
+        // Silent poll skips enhance (merge keeps higher in-memory km).
+        if (!silent) {
+          await _enhanceMetrics();
+        }
       } else {
         _allRequests = [];
         requests.value = [];
@@ -289,21 +300,50 @@ class AdminTravelRequestsController {
 
 
 
+  Future<void> _enhanceMetrics() async {
+    if (!ServiceLocator.I.has<TripRoadMetricsService>()) return;
+    // Sync all loaded trips (not just first 20) so the open trip is not skipped.
+    final targets = List<TravelRequestModel>.from(_allRequests);
+    if (targets.isEmpty) return;
+    try {
+      final enhanced = await ServiceLocator.I
+          .get<TripRoadMetricsService>()
+          .enhanceAll(targets, persist: true, syncFromTrack: true);
+      final byId = <String, TravelRequestModel>{
+        for (final r in enhanced)
+          if (r.requestId.isNotEmpty) r.requestId: r,
+      };
+      _allRequests = _allRequests.map((r) {
+        final e = byId[r.requestId];
+        return e ?? r;
+      }).toList();
+      _applyFilters();
+    } catch (e) {
+      debugPrint('AdminTravelRequests: enhanceMetrics failed: $e');
+    }
+  }
+
   void applyTripUpdate(TravelRequestModel updatedRequest) {
+    final normalized = updatedRequest
+        .ensureTripLegs()
+        .sanitizeAbsurdOfficialDistances()
+        .withRecalculatedSummary();
     final index = _allRequests.indexWhere(
       (r) =>
-          tripMatchesRealtimeKey(r, updatedRequest.requestId) ||
-          tripMatchesRealtimeKey(r, updatedRequest.restResourceId) ||
-          (updatedRequest.tripId.isNotEmpty &&
-              tripMatchesRealtimeKey(r, updatedRequest.tripId)),
+          tripMatchesRealtimeKey(r, normalized.requestId) ||
+          tripMatchesRealtimeKey(r, normalized.restResourceId) ||
+          (normalized.tripId.isNotEmpty &&
+              tripMatchesRealtimeKey(r, normalized.tripId)),
     );
     if (index == -1) {
-      _allRequests.insert(0, updatedRequest.ensureTripLegs());
+      _allRequests.insert(0, normalized);
       _allRequests.sort((a, b) => b.requestDate.compareTo(a.requestDate));
     } else {
       final old = _allRequests[index];
-      _allRequests[index] =
-          updatedRequest.mergePreservingLocalProgress(old).ensureTripLegs();
+      _allRequests[index] = normalized
+          .mergePreservingLocalProgress(old)
+          .sanitizeAbsurdOfficialDistances()
+          .withRecalculatedSummary();
     }
     _applyFilters();
   }

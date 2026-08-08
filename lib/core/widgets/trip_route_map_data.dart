@@ -1,7 +1,11 @@
+import 'dart:async';
+
+import 'package:flutter/material.dart' show Offset;
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
 import '../database/hive_database.dart';
 import '../utils/geo_utils.dart';
+import '../utils/map_marker_icon.dart';
 import '../utils/route_point_simplify.dart';
 import '../utils/trip_route_polyline_decode.dart';
 import '../../modules/travel/data/models/route_segment_model.dart';
@@ -15,6 +19,111 @@ import '../services/road_aligned_route_service.dart';
 
 final Map<String, List<LatLng>> _routePointsMemCache = {};
 final Map<String, List<Map<String, dynamic>>> _rawRoutePointsMemCache = {};
+final Map<String, List<List<List<LatLng>>>> _alignedPaintMemCache = {};
+
+String _alignedPaintSignature(TravelRequestModel r) {
+  final punches = r.tripLegs
+      .map((e) =>
+          '${e.legId}:${e.departurePunch?.time.toUtc().toIso8601String()}:'
+          '${e.arrivalPunch?.time.toUtc().toIso8601String()}')
+      .join(';');
+  return '${r.requestId}|${r.status}|$punches|rpc=${r.routePointCount}';
+}
+
+List<List<List<LatLng>>>? _decodeAlignedCache(Map<String, dynamic> row) {
+  final legsRaw = row['legs'];
+  if (legsRaw is! List || legsRaw.isEmpty) return null;
+  final out = <List<List<LatLng>>>[];
+  for (final leg in legsRaw) {
+    if (leg is! Map) continue;
+    final segsRaw = leg['segments'];
+    if (segsRaw is! List) continue;
+    final segs = <List<LatLng>>[];
+    for (final seg in segsRaw) {
+      if (seg is! List) continue;
+      final pts = <LatLng>[];
+      for (final p in seg) {
+        if (p is! Map) continue;
+        final lat = (p['lat'] as num?)?.toDouble();
+        final lng = (p['lng'] as num?)?.toDouble();
+        if (lat == null || lng == null) continue;
+        pts.add(LatLng(lat, lng));
+      }
+      if (pts.length >= 2) segs.add(pts);
+    }
+    out.add(segs);
+  }
+  if (!out.any((leg) => leg.any((s) => s.length >= 2))) return null;
+  return out;
+}
+
+Map<String, dynamic> _encodeAlignedCache(
+  String signature,
+  List<List<List<LatLng>>> legs,
+) {
+  return {
+    'signature': signature,
+    'legs': [
+      for (final leg in legs)
+        {
+          'segments': [
+            for (final seg in leg)
+              [
+                for (final p in seg)
+                  {'lat': p.latitude, 'lng': p.longitude},
+              ],
+          ],
+        },
+    ],
+  };
+}
+
+Future<void> _saveAlignedPaintCache(
+  TravelRequestModel request,
+  List<List<List<LatLng>>> legs,
+) async {
+  final id = request.requestId.isNotEmpty
+      ? request.requestId
+      : request.restResourceId;
+  if (id.isEmpty) return;
+  if (!legs.any((leg) => leg.any((s) => s.length >= 2))) return;
+  final sig = _alignedPaintSignature(request);
+  _alignedPaintMemCache[id] = legs;
+  try {
+    await HiveDatabase.instance.saveAlignedRouteCache(
+      id,
+      _encodeAlignedCache(sig, legs),
+    );
+  } catch (_) {}
+}
+
+Future<List<List<List<LatLng>>>?> _loadAlignedPaintCache(
+  TravelRequestModel request,
+) async {
+  final id = request.requestId.isNotEmpty
+      ? request.requestId
+      : request.restResourceId;
+  if (id.isEmpty) return null;
+  final sig = _alignedPaintSignature(request);
+
+  final mem = _alignedPaintMemCache[id];
+  if (mem != null && mem.any((leg) => leg.any((s) => s.length >= 2))) {
+    return mem;
+  }
+
+  try {
+    final row = await HiveDatabase.instance.getAlignedRouteCache(id);
+    if (row == null) return null;
+    if (row['signature']?.toString() != sig) return null;
+    final decoded = _decodeAlignedCache(row);
+    if (decoded != null) {
+      _alignedPaintMemCache[id] = decoded;
+    }
+    return decoded;
+  } catch (_) {
+    return null;
+  }
+}
 
 /// Hive GPS samples first, then API route points, then leg polylines.
 Future<List<LatLng>> loadTraveledRoutePoints(TravelRequestModel request) async {
@@ -116,8 +225,24 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
   // ignore: avoid_print
   print(
     '[ROAD_ALIGN] loadWholeTripPathFilled START '
-    'id=${request.requestId} status=${request.status} build=v6-hive-dedupe',
+    'id=${request.requestId} status=${request.status} build=v8-local-cache',
   );
+
+  if (!_isLiveTrackingStatus(request.status)) {
+    final cached = await _loadAlignedPaintCache(request);
+    if (cached != null && cached.isNotEmpty) {
+      final flat = <List<LatLng>>[
+        for (final leg in cached)
+          for (final seg in leg)
+            if (seg.length >= 2) seg,
+      ];
+      if (flat.isNotEmpty) {
+        // ignore: avoid_print
+        print('[ROAD_ALIGN] whole-path CACHE HIT segs=${flat.length}');
+        return flat;
+      }
+    }
+  }
 
   final pointsWithTime = await _loadRoutePointsWithTime(request);
   // ignore: avoid_print
@@ -172,7 +297,11 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
     return const [];
   }
 
-  final aligned = await RoadAlignedRouteService().align(gpsPoints: input);
+  final aligned = await RoadAlignedRouteService().align(
+    gpsPoints: input,
+    anchorStart: _tripPunchStart(request),
+    anchorEnd: _tripPunchEnd(request),
+  );
   if (!aligned.isEmpty) {
     final pieces = RoadAlignedRouteService().toMapPieces(aligned);
     // ignore: avoid_print
@@ -181,6 +310,7 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
       'alignedPts=${aligned.points.length} pieces=${pieces.length} '
       'km=${aligned.distanceKm.toStringAsFixed(2)}',
     );
+    await _saveAlignedPaintCache(request, [pieces]);
     return pieces;
   }
 
@@ -201,14 +331,6 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
   // ignore: avoid_print
   print('[ROAD_ALIGN] PAINT nothing — empty path');
   return const [];
-}
-
-bool _isSaneSnappedPath(List<LatLng> raw, List<LatLng> snapped) {
-  if (snapped.length < 2) return false;
-  final snappedLen = pathLengthMeters(snapped);
-  final rawLen = pathLengthMeters(raw);
-  if (rawLen < 50) return true;
-  return snappedLen <= rawLen * 2.8 && snappedLen >= rawLen * 0.35;
 }
 
 List<List<LatLng>> _piecesFromPath(List<LatLng> path) {
@@ -248,17 +370,37 @@ Future<
       ? request.requestId
       : request.restResourceId;
   final allPointsMap = <Map<String, dynamic>>[];
-  final isLive = _isLiveMapStatus(request.status);
+  final isLive = _isLiveTrackingStatus(request.status);
 
-  // 1) Prefer fresh server points (same source as uninstall → reinstall).
+  // 1) Memory cache
   final rawCached = _rawRoutePointsMemCache[requestId];
   if (rawCached != null && rawCached.isNotEmpty) {
     allPointsMap.addAll(rawCached);
   }
 
-  if (ServiceLocator.I.has<TravelRequestRemoteDataSource>() &&
+  // 2) Hive GPS first — reopen details should not wait on the network.
+  if (allPointsMap.isEmpty) {
+    try {
+      final hive = await HiveDatabase.instance
+          .getRoutePointsForRequest(request.requestId);
+      for (final raw in hive) {
+        final m = Map<String, dynamic>.from(raw);
+        final source = m['source']?.toString() ?? '';
+        if (source == GpsGapRoadFill.fillerSource) continue;
+        allPointsMap.add(m);
+      }
+      if (allPointsMap.isNotEmpty) {
+        _rawRoutePointsMemCache[requestId] =
+            List<Map<String, dynamic>>.from(allPointsMap);
+      }
+    } catch (_) {}
+  }
+
+  // 3) Server refresh only when live, or when we have no local points.
+  final needsServer = isLive || allPointsMap.isEmpty;
+  if (needsServer &&
+      ServiceLocator.I.has<TravelRequestRemoteDataSource>() &&
       request.restResourceId.isNotEmpty) {
-    // Always refresh for map paint — stale cache skipped kill-gap fillers.
     try {
       final api = ServiceLocator.I.get<TravelRequestRemoteDataSource>();
       final res = await api.listRoutePoints(request.restResourceId);
@@ -282,53 +424,50 @@ Future<
                 .where((p) => p.latitude != 0.0 && p.longitude != 0.0)
                 .toList(),
           );
+          // Persist server GPS locally for the next open.
+          try {
+            final hive = HiveDatabase.instance;
+            for (final m in rawList) {
+              final id = m['pointId']?.toString();
+              if (id == null || id.isEmpty) continue;
+              await hive.saveRoutePoint({
+                ...m,
+                'requestId': request.requestId,
+                'isSynced': true,
+              });
+            }
+          } catch (_) {}
         }
       }
-    } catch (_) {
-      // Keep rawCached already copied above.
-    }
+    } catch (_) {}
   }
 
   if (allPointsMap.isEmpty && request.routePoints.isNotEmpty) {
     allPointsMap.addAll(request.routePoints);
   }
 
-  final hasServer = allPointsMap.isNotEmpty;
+  final hasServerOrLocal = allPointsMap.isNotEmpty;
 
-  // 2) Hive merge:
-  // - No server → all local points.
-  // - With server → only UNSYNCED real GPS (not fillers).
-  //   Kill-gap roads are filled once at paint time; merging stored fillers
-  //   with GPS caused parallel "extra lines" / spaghetti.
-  try {
-    final hive = await HiveDatabase.instance
-        .getRoutePointsForRequest(request.requestId);
-    if (hive.isNotEmpty) {
-      if (!hasServer) {
-        for (final raw in hive) {
-          final m = Map<String, dynamic>.from(raw);
-          final source = m['source']?.toString() ?? '';
-          if (source == GpsGapRoadFill.fillerSource) continue;
-          allPointsMap.add(m);
+  // 4) Merge unsynced local GPS when we already have a base trail.
+  if (hasServerOrLocal) {
+    try {
+      final hive = await HiveDatabase.instance
+          .getRoutePointsForRequest(request.requestId);
+      for (final raw in hive) {
+        final m = Map<String, dynamic>.from(raw);
+        final source = m['source']?.toString() ?? '';
+        if (m['isSynced'] == true) continue;
+        if (source == GpsGapRoadFill.fillerSource ||
+            source == 'gap_resume' ||
+            source.contains('gap')) {
+          continue;
         }
-      } else {
-        for (final raw in hive) {
-          final m = Map<String, dynamic>.from(raw);
-          final source = m['source']?.toString() ?? '';
-          if (m['isSynced'] == true) continue;
-          if (source == GpsGapRoadFill.fillerSource ||
-              source == 'gap_resume' ||
-              source.contains('gap')) {
-            continue;
-          }
-          if (_isNearDuplicateOfAny(allPointsMap, m)) continue;
-          allPointsMap.add(m);
-        }
+        if (_isNearDuplicateOfAny(allPointsMap, m)) continue;
+        allPointsMap.add(m);
       }
-    }
-  } catch (_) {}
+    } catch (_) {}
+  }
 
-  // 3) Final spatiotemporal dedupe (same GPS under different pointIds).
   final normalized = allPointsMap
       .map((m) {
         final lat = (m['latitude'] as num?)?.toDouble() ??
@@ -355,21 +494,18 @@ Future<
 
   // ignore: avoid_print
   print(
-    '[ROAD_ALIGN] route samples serverOrLocal=${allPointsMap.length} '
-    'afterDedupe=${normalized.length} live=$isLive hasServer=$hasServer',
+    '[ROAD_ALIGN] route samples localFirst=${allPointsMap.length} '
+    'afterDedupe=${normalized.length} live=$isLive '
+    'needsServer=$needsServer',
   );
 
   return _dedupeRouteSamples(normalized);
 }
 
-bool _isLiveMapStatus(String status) {
+/// Actively tracking — needs fresh server tips.
+bool _isLiveTrackingStatus(String status) {
   final s = status.trim();
-  return s == 'Travelling' ||
-      s == 'Returning' ||
-      s == 'At Client' ||
-      s == 'In Meeting' ||
-      s == 'Ready For Next' ||
-      s == 'Ready To Return';
+  return s == 'Travelling' || s == 'Returning';
 }
 
 bool _isNearDuplicateOfAny(
@@ -487,15 +623,54 @@ Future<List<List<List<LatLng>>>> loadTraveledLegPoints(
 ) async {
   final List<List<List<LatLng>>> legPaths = [];
 
+  // Instant reopen: paint from local aligned cache (no Snap/Directions).
+  if (!_isLiveTrackingStatus(request.status)) {
+    final cached = await _loadAlignedPaintCache(request);
+    if (cached != null) {
+      // ignore: avoid_print
+      print(
+        '[ROAD_ALIGN] paint CACHE HIT legs=${cached.length} '
+        'id=${request.requestId}',
+      );
+      return cached;
+    }
+  }
+
   if (request.tripLegs.isEmpty) {
     final whole = await loadWholeTripPathFilled(request);
-    return whole.isNotEmpty ? [whole] : [];
+    if (whole.isNotEmpty) {
+      final wrapped = [whole];
+      await _saveAlignedPaintCache(request, wrapped);
+      return wrapped;
+    }
+    return [];
   }
 
   final pointsWithTime = await _loadRoutePointsWithTime(request);
+  final isLive = _isLiveTrackingStatus(request.status);
 
   for (final leg in request.tripLegs) {
     List<List<LatLng>> segments = const [];
+
+    // Completed legs: use stored polyline first (no network Snap).
+    if (!isLive && leg.arrivalPunch != null) {
+      if (leg.routePolylineEncoded != null &&
+          leg.routePolylineEncoded!.isNotEmpty) {
+        final decoded = decodePipePolyline(leg.routePolylineEncoded);
+        if (decoded.length >= 2) {
+          legPaths.add([decoded]);
+          continue;
+        }
+      }
+      if (leg.matchedRoutePolylineEncoded != null &&
+          leg.matchedRoutePolylineEncoded!.isNotEmpty) {
+        final decoded = decodePipePolyline(leg.matchedRoutePolylineEncoded);
+        if (decoded.length >= 2) {
+          legPaths.add([decoded]);
+          continue;
+        }
+      }
+    }
 
     if (leg.departurePunch != null) {
       final start = leg.departurePunch!.time.toUtc();
@@ -542,8 +717,19 @@ Future<List<List<List<LatLng>>>> loadTraveledLegPoints(
               ),
             )
             .toList(growable: false);
-        final aligned =
-            await RoadAlignedRouteService().align(gpsPoints: input);
+        final aligned = await RoadAlignedRouteService().align(
+          gpsPoints: input,
+          anchorStart: LatLng(
+            leg.departurePunch!.latitude,
+            leg.departurePunch!.longitude,
+          ),
+          anchorEnd: leg.arrivalPunch != null
+              ? LatLng(
+                  leg.arrivalPunch!.latitude,
+                  leg.arrivalPunch!.longitude,
+                )
+              : null,
+        );
         if (!aligned.isEmpty) {
           segments = RoadAlignedRouteService().toMapPieces(aligned);
         }
@@ -554,7 +740,6 @@ Future<List<List<List<LatLng>>>> loadTraveledLegPoints(
       legPaths.add(segments);
     } else if (leg.matchedRoutePolylineEncoded != null &&
         leg.matchedRoutePolylineEncoded!.isNotEmpty) {
-      // Prefer Nest/road matched over raw GPS pipe polyline after mark arrival.
       legPaths.add([decodePipePolyline(leg.matchedRoutePolylineEncoded)]);
     } else if (leg.routePolylineEncoded != null &&
         leg.routePolylineEncoded!.isNotEmpty) {
@@ -564,14 +749,16 @@ Future<List<List<List<LatLng>>>> loadTraveledLegPoints(
     }
   }
 
-  // Never copy the full trip onto every empty leg — that painted 2–3 identical
-  // lines on "Whole route". Leave empty legs empty; Whole route merges what exists.
   if (request.tripLegs.length == 1 &&
       legPaths.isNotEmpty &&
       legPaths.first.every((s) => s.isEmpty) &&
       pointsWithTime.isNotEmpty) {
     final whole = await loadWholeTripPathFilled(request);
     if (whole.isNotEmpty) legPaths[0] = whole;
+  }
+
+  if (legPaths.any((leg) => leg.any((s) => s.length >= 2))) {
+    await _saveAlignedPaintCache(request, legPaths);
   }
 
   return legPaths;
@@ -640,6 +827,8 @@ void evictRoutePointsCache(String id) {
   if (id.isEmpty) return;
   _routePointsMemCache.remove(id);
   _rawRoutePointsMemCache.remove(id);
+  _alignedPaintMemCache.remove(id);
+  unawaited(HiveDatabase.instance.clearAlignedRouteCache(id));
 }
 
 /// Display-ready path segments (spike-stripped, no absurd chords).
@@ -732,4 +921,152 @@ LatLng? tripMapDestinationTarget(TravelRequestModel r) {
     }
   }
   return (origin: origin, dest: dest);
+}
+
+LatLng? _tripPunchStart(TravelRequestModel r) {
+  for (final leg in r.tripLegs) {
+    final p = leg.departurePunch;
+    if (p == null) continue;
+    if (p.latitude.abs() < 1e-6 && p.longitude.abs() < 1e-6) continue;
+    return LatLng(p.latitude, p.longitude);
+  }
+  return tripDrivingEndpoints(r).origin;
+}
+
+LatLng? _tripPunchEnd(TravelRequestModel r) {
+  // Live trips: don't force the trail tip onto a future destination.
+  final s = r.status.trim();
+  final live = s == 'Travelling' ||
+      s == 'Returning' ||
+      s == 'At Client' ||
+      s == 'In Meeting';
+  if (live) return null;
+
+  for (final leg in r.tripLegs.reversed) {
+    final p = leg.arrivalPunch;
+    if (p == null) continue;
+    if (p.latitude.abs() < 1e-6 && p.longitude.abs() < 1e-6) continue;
+    return LatLng(p.latitude, p.longitude);
+  }
+  return tripDrivingEndpoints(r).dest;
+}
+
+/// Map pin for trip start — prefers departure punch over painted path tip.
+LatLng? tripMapStartMarkerTarget(
+  TravelRequestModel r, {
+  LatLng? pathFirst,
+}) {
+  return _tripPunchStart(r) ?? pathFirst ?? tripMapStartTarget(r);
+}
+
+/// Map pin for trip end / live tip.
+LatLng? tripMapEndMarkerTarget(
+  TravelRequestModel r, {
+  LatLng? pathLast,
+  bool isLive = false,
+}) {
+  if (isLive) return pathLast;
+  return _tripPunchEnd(r) ?? pathLast ?? tripMapDestinationTarget(r);
+}
+
+/// A client / meeting stop along a multi-leg trip.
+class TripMapStop {
+  const TripMapStop({
+    required this.position,
+    required this.index,
+    required this.title,
+    this.snippet,
+  });
+
+  final LatLng position;
+  final int index;
+  final String title;
+  final String? snippet;
+}
+
+bool _punchUsable(TripPunchModel? p) {
+  if (p == null) return false;
+  return p.latitude.abs() >= 1e-6 || p.longitude.abs() >= 1e-6;
+}
+
+/// Client stops (arrival / meeting) — excludes return-home and the final
+/// destination when there is no return leg (that point is the End marker).
+List<TripMapStop> tripMapStops(TravelRequestModel r) {
+  final legs = r.tripLegs;
+  if (legs.isEmpty) return const [];
+
+  final clientLegs = legs.where((l) => !l.isReturnLeg).toList();
+  final hasReturn = legs.any((l) => l.isReturnLeg);
+  final out = <TripMapStop>[];
+  var n = 0;
+
+  for (var i = 0; i < clientLegs.length; i++) {
+    final leg = clientLegs[i];
+    final isLastClient = i == clientLegs.length - 1;
+    // Single final destination with no return = End marker, not Stop.
+    if (isLastClient && !hasReturn && clientLegs.length == 1) continue;
+
+    final punch = _punchUsable(leg.arrivalPunch)
+        ? leg.arrivalPunch
+        : (_punchUsable(leg.meetingStartPunch) ? leg.meetingStartPunch : null);
+    if (punch == null) continue;
+
+    // Last client before return home is still a stop (office end is separate).
+    // Last client with no return is also a stop when there are multiple clients.
+    n++;
+    final name = leg.clientName.trim().isNotEmpty
+        ? leg.clientName.trim()
+        : (leg.toLocation.trim().isNotEmpty
+            ? leg.toLocation.trim()
+            : 'Client');
+    out.add(
+      TripMapStop(
+        position: LatLng(punch.latitude, punch.longitude),
+        index: n,
+        title: 'Stop $n',
+        snippet: name,
+      ),
+    );
+  }
+
+  return out;
+}
+
+/// Orange stop pins; skips positions that sit on [exclude] (start/end).
+Set<Marker> tripStopMarkers(
+  TravelRequestModel r, {
+  List<LatLng> exclude = const [],
+  double minSeparationMeters = 35,
+}) {
+  final stops = tripMapStops(r);
+  if (stops.isEmpty) return {};
+
+  bool tooClose(LatLng a) {
+    for (final e in exclude) {
+      final d = GeoUtils.distanceMeters(
+        a.latitude,
+        a.longitude,
+        e.latitude,
+        e.longitude,
+      );
+      if (d < minSeparationMeters) return true;
+    }
+    return false;
+  }
+
+  final markers = <Marker>{};
+  for (final s in stops) {
+    if (tooClose(s.position)) continue;
+    markers.add(
+      Marker(
+        markerId: MarkerId('stop_${s.index}'),
+        position: s.position,
+        icon: mapStopMarkerIcon,
+        anchor: const Offset(0.5, 1.0),
+        infoWindow: InfoWindow(title: s.title, snippet: s.snippet),
+        zIndexInt: 2,
+      ),
+    );
+  }
+  return markers;
 }

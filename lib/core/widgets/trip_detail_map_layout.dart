@@ -82,7 +82,9 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   /// Start easing the action button toward the screen bottom.
   static const double _actionPinStart = 0.68;
 
-  static const double _actionButtonHeight = 56;
+  /// Approx height of floating punch UI (reminder banner + large button).
+  /// Used to keep map FABs above the overlay.
+  static const double _actionWithReminderHeight = 168;
 
   /// Map padding tracks sheet size only after drag settles — avoids rebuilding
   /// the platform map view every frame while dragging.
@@ -431,26 +433,21 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     unawaited(loadFuture);
   }
 
-  /// Prefer cleaned GPS trail km when Nest "official" was inflated by extras.
+  /// Same km as list cards — never use painted-path length (it drifts every
+  /// Snap/Directions reload). Live trips may show tracked tip length only when
+  /// stored km is still missing.
   (double? km, String label) _sheetDistance(TravelRequestModel request) {
-    final official = request.effectiveDistanceKm > 0
+    final cardKm = request.effectiveDistanceKm > 0
         ? request.effectiveDistanceKm
         : (request.distance ?? 0);
+    if (cardKm > 0.05) {
+      return (cardKm, request.displayDistanceLabel);
+    }
     final tracked = _trackedPathKm;
     if (tracked != null && tracked > 0.05) {
-      if (official <= 0) return (tracked, 'Tracked');
-      // Official much higher than painted path → show tracked (extras inflated km).
-      if (official > tracked * 1.15 && official - tracked > 0.3) {
-        return (tracked, 'Tracked');
-      }
+      return (tracked, 'Tracked');
     }
-    if (official > 0) {
-      return (official, request.displayDistanceLabel);
-    }
-    return (
-      tracked,
-      tracked != null ? 'Tracked' : request.displayDistanceLabel
-    );
+    return (null, request.displayDistanceLabel);
   }
 
   void _syncMatchedLoad() {
@@ -537,7 +534,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       Marker(
         markerId: const MarkerId('planned_start'),
         position: start,
-        icon: mapMarkerIcon(BitmapDescriptor.hueGreen),
+        icon: mapStartMarkerIcon,
         anchor: const Offset(0.5, 1.0),
         infoWindow: InfoWindow(
           title: 'Start',
@@ -554,7 +551,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         Marker(
           markerId: const MarkerId('planned_dest'),
           position: dest,
-          icon: mapMarkerIcon(BitmapDescriptor.hueRed),
+          icon: mapEndMarkerIcon,
           anchor: const Offset(0.5, 1.0),
           infoWindow: InfoWindow(
             title: 'Destination',
@@ -563,6 +560,16 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         ),
       );
     }
+
+    markers.addAll(
+      tripStopMarkers(
+        widget.request,
+        exclude: [
+          start,
+          if (dest != null) dest,
+        ],
+      ),
+    );
 
     return markers;
   }
@@ -789,11 +796,25 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     final sanitized = mapDisplayRoutePoints(display);
     if (sanitized.isEmpty) return {};
 
+    final startPos = tripMapStartMarkerTarget(
+          widget.request,
+          pathFirst: sanitized.first,
+        ) ??
+        sanitized.first;
+    final endPos = sanitized.length > 1
+        ? (tripMapEndMarkerTarget(
+              widget.request,
+              pathLast: sanitized.last,
+              isLive: _isLiveTrip,
+            ) ??
+            sanitized.last)
+        : null;
+
     final markers = <Marker>{
       Marker(
         markerId: const MarkerId('route_start'),
-        position: sanitized.first,
-        icon: mapMarkerIcon(BitmapDescriptor.hueGreen),
+        position: startPos,
+        icon: mapStartMarkerIcon,
         anchor: const Offset(0.5, 1.0),
         infoWindow: InfoWindow(
           title: 'Start',
@@ -802,14 +823,14 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       ),
     };
 
-    if (sanitized.length > 1) {
+    if (endPos != null &&
+        (endPos.latitude != startPos.latitude ||
+            endPos.longitude != startPos.longitude)) {
       markers.add(
         Marker(
           markerId: const MarkerId('route_current'),
-          position: sanitized.last,
-          icon: mapMarkerIcon(
-            _isLiveTrip ? BitmapDescriptor.hueAzure : BitmapDescriptor.hueRed,
-          ),
+          position: endPos,
+          icon: _isLiveTrip ? mapLiveMarkerIcon : mapEndMarkerIcon,
           anchor: const Offset(0.5, 1.0),
           infoWindow: InfoWindow(
             title: _isLiveTrip ? 'Current location' : 'End',
@@ -818,6 +839,16 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         ),
       );
     }
+
+    markers.addAll(
+      tripStopMarkers(
+        widget.request,
+        exclude: [
+          startPos,
+          if (endPos != null) endPos,
+        ],
+      ),
+    );
 
     return markers;
   }
@@ -882,6 +913,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       height: null,
       lineColor: AppColors.primary,
       initialCenterOnFirstPoint: true,
+      stopPoints: tripMapStops(widget.request).map((s) => s.position).toList(),
     );
   }
 
@@ -1041,9 +1073,10 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     final hasPath = flattened.isNotEmpty;
     if (!hasPath) return const SizedBox.shrink();
 
-    // Stay above the sheet; lift further when the action button floats there too.
-    final actionLift =
-        _hasActionButton ? (_actionButtonHeight + 12) * (1 - _actionPinT) : 0.0;
+    // Stay above the sheet + floating punch stack (reminder can be tall).
+    final actionLift = _hasActionButton
+        ? (_actionWithReminderHeight + 12) * (1 - _actionPinT)
+        : 0.0;
     final bottomOffset = _aboveSheetBottom(screenH, gap: 12) + actionLift;
 
     return Positioned(
@@ -1078,7 +1111,6 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     final pinT = _actionPinT;
     final bottom = _actionButtonBottom(screenH);
     final horizontalInset = 16.0 * (1 - pinT);
-    final radius = 16.0 * (1 - pinT);
 
     if (pinT >= 0.98) {
       return Positioned(
@@ -1102,6 +1134,8 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       );
     }
 
+    // Transparent — warning + button carry their own backgrounds. A white
+    // Material here filled the gap between them and covered map FABs.
     return Positioned(
       left: horizontalInset,
       right: horizontalInset,
@@ -1109,11 +1143,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       child: mapWebPointerShield(
         enabled: _shieldWebMapOverlays,
         child: Material(
-          elevation: 8,
-          shadowColor: Colors.black26,
-          borderRadius: BorderRadius.circular(radius),
-          clipBehavior: Clip.antiAlias,
-          color: AppColors.surface,
+          type: MaterialType.transparency,
           child: child,
         ),
       ),

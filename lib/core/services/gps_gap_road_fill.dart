@@ -36,11 +36,10 @@ abstract final class GpsGapRoadFill {
   static const double softFillMinMeters = 400;
 
   /// Neighbors must be this close to treat mid point as a teleport spike.
-  static const double spikeSkipMaxMeters = 70;
+  static const double spikeSkipMaxMeters = 120;
 
   /// Mid point must be at least this far off the skip chord to count as a spike.
-  /// Keep high enough that real road curves are not deleted before Snap.
-  static const double spikeOutMinMeters = 55;
+  static const double spikeOutMinMeters = 40;
 
   /// Reject Directions detours that invent long loops.
   /// Short hops get a tight cap (stops 61m → 267m fake roads).
@@ -187,7 +186,7 @@ abstract final class GpsGapRoadFill {
   /// Drop A→B→toward-A GPS loops that paint as "extra lines" / spaghetti.
   static List<GpsGapInputPoint> stripBacktrackLoops(
     List<GpsGapInputPoint> points, {
-    double minLegMeters = 25,
+    double minLegMeters = 20,
   }) {
     if (points.length < 3) return points;
     final out = <GpsGapInputPoint>[points.first];
@@ -201,8 +200,8 @@ abstract final class GpsGapRoadFill {
         final dBN = GeoUtils.distanceMeters(b.lat, b.lng, next.lat, next.lng);
         // Went A→B then next is closer to A than B was → drop B (backtrack).
         if (dAB >= minLegMeters &&
-            dBN >= 15 &&
-            dAN < dAB * 0.55 &&
+            dBN >= 12 &&
+            dAN < dAB * 0.6 &&
             dAN < dBN) {
           out.removeLast();
           continue;
@@ -224,38 +223,121 @@ abstract final class GpsGapRoadFill {
     return out;
   }
 
-  /// Drop one-point teleport spikes (A→far B→near A again) before gap-fill.
+  /// Drop thin V / hairpin spikes (including near the end of the trail).
   static List<GpsGapInputPoint> stripSpikePoints(
       List<GpsGapInputPoint> points) {
     if (points.length < 3) return points;
-    final out = <GpsGapInputPoint>[points.first];
-    for (var i = 1; i < points.length - 1; i++) {
-      final prev = out.last;
-      final mid = points[i];
-      final next = points[i + 1];
-      final dPrev =
-          GeoUtils.distanceMeters(prev.lat, prev.lng, mid.lat, mid.lng);
-      final dNext =
-          GeoUtils.distanceMeters(mid.lat, mid.lng, next.lat, next.lng);
-      final dSkip =
-          GeoUtils.distanceMeters(prev.lat, prev.lng, next.lat, next.lng);
-      // Urban GPS spikes are often 40–150m off the road (not only >250m teleports).
-      if (dPrev > spikeOutMinMeters &&
-          dNext > spikeOutMinMeters &&
-          dSkip < spikeSkipMaxMeters &&
-          dSkip < dPrev * 0.45 &&
-          dSkip < dNext * 0.45) {
-        debugPrint(
-          'GpsGapRoadFill: dropping spike '
-          '(${dPrev.toStringAsFixed(0)}m / ${dNext.toStringAsFixed(0)}m, '
-          'skip ${dSkip.toStringAsFixed(0)}m)',
-        );
-        continue;
+    var work = List<GpsGapInputPoint>.from(points);
+    // Multiple passes — nested spikes / long V loops.
+    for (var pass = 0; pass < 3; pass++) {
+      final out = <GpsGapInputPoint>[work.first];
+      for (var i = 1; i < work.length - 1; i++) {
+        final prev = out.last;
+        final mid = work[i];
+        final next = work[i + 1];
+        final dPrev =
+            GeoUtils.distanceMeters(prev.lat, prev.lng, mid.lat, mid.lng);
+        final dNext =
+            GeoUtils.distanceMeters(mid.lat, mid.lng, next.lat, next.lng);
+        final dSkip =
+            GeoUtils.distanceMeters(prev.lat, prev.lng, next.lat, next.lng);
+        if (dPrev > spikeOutMinMeters &&
+            dNext > spikeOutMinMeters &&
+            dSkip < spikeSkipMaxMeters &&
+            dSkip < dPrev * 0.55 &&
+            dSkip < dNext * 0.55) {
+          continue;
+        }
+        // Long thin spike: out-and-back where return nearly retraces.
+        if (dPrev > 80 &&
+            dNext > 80 &&
+            dSkip < dPrev * 0.35 &&
+            dSkip < dNext * 0.35) {
+          continue;
+        }
+        out.add(mid);
       }
-      out.add(mid);
+      out.add(work.last);
+      final nextWork = stripDetourLoops(stripBacktrackLoops(out));
+      if (nextWork.length >= work.length) {
+        work = nextWork;
+        break;
+      }
+      work = nextWork;
     }
-    out.add(points.last);
-    return stripBacktrackLoops(out);
+    return work;
+  }
+
+  /// Drop GPS detours that leave and return near the same point (bungalow loops).
+  static List<GpsGapInputPoint> stripDetourLoops(
+    List<GpsGapInputPoint> points, {
+    double maxReturnChordMeters = 75,
+    double minLoopPathMeters = 100,
+    double minPathVsChordRatio = 2.6,
+    double maxLoopPathMeters = 2200,
+  }) {
+    if (points.length < 5) return points;
+    var work = List<GpsGapInputPoint>.from(points);
+
+    for (var pass = 0; pass < 5; pass++) {
+      int? bestI;
+      int? bestJ;
+      var bestPath = 0.0;
+
+      for (var i = 0; i < work.length - 4; i++) {
+        var pathFromI = 0.0;
+        for (var j = i + 1; j < work.length; j++) {
+          pathFromI += GeoUtils.distanceMeters(
+            work[j - 1].lat,
+            work[j - 1].lng,
+            work[j].lat,
+            work[j].lng,
+          );
+          if (pathFromI > maxLoopPathMeters) break;
+          if (j < i + 3) continue;
+          if (pathFromI < minLoopPathMeters) continue;
+
+          final chord = GeoUtils.distanceMeters(
+            work[i].lat,
+            work[i].lng,
+            work[j].lat,
+            work[j].lng,
+          );
+          if (chord > maxReturnChordMeters) continue;
+
+          final isLoop = chord <= 30
+              ? pathFromI >= minLoopPathMeters
+              : pathFromI >= chord * minPathVsChordRatio;
+          if (!isLoop) continue;
+
+          if (pathFromI > bestPath) {
+            bestPath = pathFromI;
+            bestI = i;
+            bestJ = j;
+          }
+        }
+      }
+
+      if (bestI == null || bestJ == null || bestJ <= bestI + 1) break;
+
+      final next = <GpsGapInputPoint>[
+        ...work.sublist(0, bestI + 1),
+        ...work.sublist(bestJ),
+      ];
+      if (next.length > bestI + 1) {
+        final d = GeoUtils.distanceMeters(
+          next[bestI].lat,
+          next[bestI].lng,
+          next[bestI + 1].lat,
+          next[bestI + 1].lng,
+        );
+        if (d < 18) next.removeAt(bestI + 1);
+      }
+      if (next.length >= work.length) break;
+      work = next;
+    }
+
+    return work;
   }
 
   /// Kill/reopen used to persist multiple Directions generations for the same

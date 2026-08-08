@@ -100,11 +100,11 @@ class MapMatchingService {
     final updatedLegs = request.tripLegs.map((leg) {
       final m = byLeg[leg.legId];
       if (m == null) {
-        // Trip-level official only: keep leg GPS provisional.
+        // Trip-level official only: never overwrite stored GPS km.
         if (match.officialDistanceKm != null && request.tripLegs.length == 1) {
-          final gps = match.provisionalDistanceKm ??
-              leg.provisionalDistanceKm ??
-              leg.actualDistanceKmFromTrack;
+          final gps = leg.provisionalDistanceKm ??
+              leg.actualDistanceKmFromTrack ??
+              match.provisionalDistanceKm;
           final official = match.officialDistanceKm!;
           if (DistanceSanity.isOfficialAbsurd(
             officialKm: official,
@@ -129,9 +129,10 @@ class MapMatchingService {
         return leg;
       }
 
-      final gps = m.provisionalDistanceKm ??
-          leg.provisionalDistanceKm ??
-          leg.actualDistanceKmFromTrack;
+      // Prefer already-persisted GPS over Nest match provisional (stable cards).
+      final gps = leg.provisionalDistanceKm ??
+          leg.actualDistanceKmFromTrack ??
+          m.provisionalDistanceKm;
       final official = m.officialDistanceKm;
       if (official != null &&
           DistanceSanity.isOfficialAbsurd(

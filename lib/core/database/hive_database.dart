@@ -10,6 +10,7 @@ class HiveDatabase {
   static Box<Map>? _trackingEventsBox;
   static Box<Map>? _trackingCoverageCacheBox;
   static Box<Map>? _matchedRouteCacheBox;
+  static Box<Map>? _alignedRouteCacheBox;
   static Box<Map>? _sessionBox;
 
   static HiveDatabase? _instance;
@@ -41,6 +42,8 @@ class HiveDatabase {
           await Hive.openBox<Map>('tracking_coverage_cache');
       _matchedRouteCacheBox =
           await Hive.openBox<Map>('matched_route_cache');
+      _alignedRouteCacheBox =
+          await Hive.openBox<Map>('aligned_route_cache');
       _sessionBox = await Hive.openBox<Map>('app_session');
 
     } catch (e) {
@@ -58,6 +61,7 @@ class HiveDatabase {
     await _trackingEventsBox?.close();
     await _trackingCoverageCacheBox?.close();
     await _matchedRouteCacheBox?.close();
+    await _alignedRouteCacheBox?.close();
     await _sessionBox?.close();
   }
 
@@ -652,5 +656,32 @@ class HiveDatabase {
     final row = _matchedRouteCacheBox?.get(requestId);
     if (row == null) return null;
     return Map<String, dynamic>.from(row);
+  }
+
+  // --- Aligned / painted route (skip Snap+Directions on reopen) ---
+
+  Future<void> saveAlignedRouteCache(
+    String requestId,
+    Map<String, dynamic> data,
+  ) async {
+    if (requestId.isEmpty) return;
+    await _alignedRouteCacheBox?.put(
+      requestId,
+      {
+        ...Map<String, dynamic>.from(data),
+        'cachedAt': DateTime.now().toIso8601String(),
+      },
+    );
+  }
+
+  Future<Map<String, dynamic>?> getAlignedRouteCache(String requestId) async {
+    final row = _alignedRouteCacheBox?.get(requestId);
+    if (row == null) return null;
+    return Map<String, dynamic>.from(row);
+  }
+
+  Future<void> clearAlignedRouteCache(String requestId) async {
+    if (requestId.isEmpty) return;
+    await _alignedRouteCacheBox?.delete(requestId);
   }
 }

@@ -227,14 +227,14 @@ class TripLegModel {
     );
   }
 
-  String get displayDistanceLabel {
-    if (hasOfficialDistance) return 'Official';
-    if (provisionalDistanceKm != null || actualDistanceKmFromTrack != null) {
-      return 'Approx (GPS)';
-    }
-    if (plannedDistanceKm != null) return 'Planned';
-    return 'Distance';
-  }
+  String get displayDistanceLabel => DistanceSanity.selectLegKmLabel(
+        officialKm: officialDistanceKm,
+        provisionalKm: provisionalDistanceKm,
+        trackKm: actualDistanceKmFromTrack,
+        plannedKm: plannedDistanceKm,
+        punchKm: actualDistanceKm,
+        travelMinutes: travelDurationMinutes,
+      );
 
   /// True when stored official km is a teleport / map-match blow-up.
   bool get hasAbsurdOfficialDistance {
@@ -726,25 +726,12 @@ class TravelRequestModel extends TravelRequestEntity {
     return labels.where((label) => label.trim().isNotEmpty).join(' → ');
   }
 
-  /// Best distance for allowance: sane leg total, API total, or odometer meters.
+  /// Best distance for cards / allowance — same formula for admin and user.
+  /// Always prefer per-leg GPS/sane km when present so Nest official totals
+  /// cannot diverge between panels.
   double get effectiveDistanceKm {
     final saneLegsKm = _calculateSummary(tripLegs).totalDistanceKm;
-    if (saneLegsKm > 0) {
-      if (totalDistanceKm <= 0) return saneLegsKm;
-      // Prefer GPS/sane legs when stored trip total was inflated by bad match.
-      if (totalDistanceKm > saneLegsKm * DistanceSanity.maxOfficialVsGpsRatio &&
-          totalDistanceKm - saneLegsKm > DistanceSanity.minAbsDeltaKm) {
-        return saneLegsKm;
-      }
-      if (DistanceSanity.isOfficialAbsurd(
-        officialKm: totalDistanceKm,
-        gpsKm: saneLegsKm,
-        travelMinutes: totalTravelDurationMinutes,
-      )) {
-        return saneLegsKm;
-      }
-      return totalDistanceKm;
-    }
+    if (saneLegsKm > 0.05) return saneLegsKm;
     if (totalDistanceKm > 0) return totalDistanceKm;
     final meters = distance ?? 0;
     if (meters > 0) return meters / 1000;
@@ -756,6 +743,19 @@ class TravelRequestModel extends TravelRequestEntity {
       tripLegs.any((l) => l.hasOfficialDistance);
 
   String get displayDistanceLabel {
+    if (tripLegs.isEmpty) {
+      if (totalDistanceKm > 0) return 'Distance';
+      return 'Travelled';
+    }
+    // Prefer GPS label when any leg is showing track km (card/detail parity).
+    final anyGps = tripLegs.any((l) {
+      final gps = l.provisionalDistanceKm ?? l.actualDistanceKmFromTrack;
+      if (gps == null || gps <= 0.05) return false;
+      final chosen = l.displayDistanceKm;
+      return chosen != null && (chosen - gps).abs() <= 0.02;
+    });
+    if (anyGps) return 'Approx (GPS)';
+
     if (hasOfficialDistance) return 'Official';
     if (tripLegs.any((l) =>
         l.provisionalDistanceKm != null ||
@@ -909,10 +909,9 @@ class TravelRequestModel extends TravelRequestEntity {
       city: city.trim().isNotEmpty ? city : local.city,
       vehicleType: vehicleType.trim().isNotEmpty ? vehicleType : local.vehicleType,
       fuelType: fuelType ?? local.fuelType,
-      totalDistanceKm:
-          totalDistanceKm > 0 ? totalDistanceKm : local.totalDistanceKm,
-      travelAllowance:
-          travelAllowance > 0 ? travelAllowance : local.travelAllowance,
+      // Never let a stale lower API total wipe a higher GPS km (17.8 vs 20.5).
+      totalDistanceKm: _preferHigherKm(totalDistanceKm, local.totalDistanceKm),
+      travelAllowance: _preferHigherKm(travelAllowance, local.travelAllowance),
       fuelRatePerKm: fuelRatePerKm ?? local.fuelRatePerKm,
       clientName: clientName.isNotEmpty ? clientName : local.clientName,
       purpose: purpose ?? local.purpose,
@@ -955,12 +954,14 @@ class TravelRequestModel extends TravelRequestEntity {
           : local.vehicleType,
       fuelType: merged.fuelType ?? local.fuelType,
       fuelRatePerKm: merged.fuelRatePerKm ?? local.fuelRatePerKm,
-      travelAllowance: merged.travelAllowance > 0
-          ? merged.travelAllowance
-          : local.travelAllowance,
-      totalDistanceKm: merged.totalDistanceKm > 0
-          ? merged.totalDistanceKm
-          : local.totalDistanceKm,
+      travelAllowance: _preferHigherKm(
+        merged.travelAllowance,
+        local.travelAllowance,
+      ),
+      totalDistanceKm: _preferHigherKm(
+        merged.totalDistanceKm,
+        local.totalDistanceKm,
+      ),
       totalTravelDurationMinutes: merged.totalTravelDurationMinutes > 0
           ? merged.totalTravelDurationMinutes
           : local.totalTravelDurationMinutes,
@@ -1448,12 +1449,22 @@ class TravelRequestModel extends TravelRequestEntity {
   }
 
   /// Prefer the more complete GPS track; avoid inflated remote overwriting local.
+  /// Prefer the fuller GPS trail when both sides have km (e.g. user 20.5 vs
+  /// stale list 17.8). Tiny jitter keeps local for stability.
   static double? _preferGpsKm(double? remote, double? local) {
-    if (remote == null || remote <= 0) return local;
-    if (local == null || local <= 0) return remote;
-    if (remote > local * 1.35 && remote - local > 0.5) return local;
-    if (local > remote * 1.15 && local - remote > 0.3) return local;
-    return remote;
+    if (local != null && local > 0.05 && remote != null && remote > 0.05) {
+      if ((local - remote).abs() <= 0.15) return local;
+      return local >= remote ? local : remote;
+    }
+    if (local != null && local > 0.05) return local;
+    if (remote != null && remote > 0.05) return remote;
+    return local ?? remote;
+  }
+
+  static double _preferHigherKm(double a, double b) {
+    if (a <= 0) return b;
+    if (b <= 0) return a;
+    return a >= b ? a : b;
   }
 
   static double? _preferSaneOfficialKm({

@@ -20,6 +20,7 @@ class RoutePolylineMapView extends StatefulWidget {
     this.extraPolylines = const [],
     this.simplify = true,
     this.initialCenterOnFirstPoint = false,
+    this.stopPoints = const [],
   });
 
   final List<LatLng> points;
@@ -28,6 +29,9 @@ class RoutePolylineMapView extends StatefulWidget {
   final bool showEndpoints;
   final bool simplify;
   final bool initialCenterOnFirstPoint;
+
+  /// Client stop pins (orange), separate from start/end.
+  final List<LatLng> stopPoints;
 
   /// Additional paths (e.g. driving alternatives) drawn under the main trail.
   final List<({List<LatLng> points, Color color, double width})> extraPolylines;
@@ -143,16 +147,33 @@ class _RoutePolylineMapViewState extends State<RoutePolylineMapView> {
     _didInitialFit = true;
   }
 
-  Widget _endpointDot(Color color) => Container(
-        width: 14,
-        height: 14,
-        decoration: BoxDecoration(
-          color: color,
-          shape: BoxShape.circle,
-          border: Border.all(color: Colors.white, width: 2),
-          boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 4)],
+  Widget _endpointPin(Color color, String label) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: BorderRadius.circular(4),
+            boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 3)],
+          ),
+          child: Text(
+            label,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              height: 1.1,
+            ),
+          ),
         ),
-      );
+        Icon(Icons.location_on, color: color, size: 28, shadows: const [
+          Shadow(color: Colors.black38, blurRadius: 3),
+        ]),
+      ],
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -186,16 +207,28 @@ class _RoutePolylineMapViewState extends State<RoutePolylineMapView> {
             markers: [
               Marker(
                 point: _primary.first,
-                width: 20,
-                height: 20,
-                child: _endpointDot(Colors.green),
+                width: 56,
+                height: 52,
+                alignment: Alignment.bottomCenter,
+                child: _endpointPin(Colors.green.shade700, 'Start'),
               ),
+              ...List.generate(widget.stopPoints.length, (i) {
+                final p = widget.stopPoints[i];
+                return Marker(
+                  point: ll.LatLng(p.latitude, p.longitude),
+                  width: 56,
+                  height: 52,
+                  alignment: Alignment.bottomCenter,
+                  child: _endpointPin(Colors.orange.shade800, 'Stop ${i + 1}'),
+                );
+              }),
               if (_primary.length > 1)
                 Marker(
                   point: _primary.last,
-                  width: 20,
-                  height: 20,
-                  child: _endpointDot(Colors.red),
+                  width: 56,
+                  height: 52,
+                  alignment: Alignment.bottomCenter,
+                  child: _endpointPin(Colors.red.shade700, 'End'),
                 ),
             ],
           ),

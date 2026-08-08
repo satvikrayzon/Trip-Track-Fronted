@@ -23,6 +23,7 @@ import '../../../travel/data/models/travel_request_model.dart';
 import '../../../travel/services/travel_request_delete_service.dart';
 import '../../../travel/utils/travel_request_delete_utils.dart';
 import '../../../../features/tracking/data/services/trip_realtime_binder.dart';
+import '../../../../core/services/trip_road_metrics_service.dart';
 
 
 
@@ -224,9 +225,10 @@ class AdminDashboardController {
         case ApiSuccess(:final data):
 
           requests = data.items
-
-              .map((m) => TravelRequestModel.fromMap(m))
-
+              .map((m) => TravelRequestModel.fromMap(m)
+                  .ensureTripLegs()
+                  .sanitizeAbsurdOfficialDistances()
+                  .withRecalculatedSummary())
               .toList();
 
           requests.sort((a, b) => b.requestDate.compareTo(a.requestDate));
@@ -285,6 +287,10 @@ class AdminDashboardController {
 
         completedRequests.value = completed;
 
+        if (showBlockingSpinner) {
+          unawaited(_enhanceRecentMetrics());
+        }
+
       }
 
     } catch (e) {
@@ -310,6 +316,23 @@ class AdminDashboardController {
 
 
 
+  Future<void> _enhanceRecentMetrics() async {
+    if (!ServiceLocator.I.has<TripRoadMetricsService>()) return;
+    final current = recentRequests.value;
+    if (current.isEmpty) return;
+    try {
+      final enhanced = await ServiceLocator.I
+          .get<TripRoadMetricsService>()
+          .enhanceAll(current, persist: true, syncFromTrack: true);
+      recentRequests.value = enhanced;
+      pendingRequests.value =
+          enhanced.where((r) => r.status != 'Completed').length;
+      completedRequests.value =
+          enhanced.where((r) => r.status == 'Completed').length;
+      _lastSnapshot = null;
+    } catch (_) {}
+  }
+
   void updateRequestLocally(TravelRequestModel updatedRequest) {
 
     final list = List<TravelRequestModel>.from(recentRequests.value);
@@ -324,7 +347,10 @@ class AdminDashboardController {
 
     if (index != -1) {
       final oldRequest = list[index];
-      list[index] = updatedRequest.mergePreservingLocalProgress(oldRequest);
+      list[index] = updatedRequest
+          .mergePreservingLocalProgress(oldRequest)
+          .sanitizeAbsurdOfficialDistances()
+          .withRecalculatedSummary();
 
       recentRequests.value = list;
 

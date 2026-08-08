@@ -6,18 +6,21 @@ import '../config/google_maps_config.dart';
 import '../database/hive_database.dart';
 import '../di/service_locator.dart';
 import '../network/models/api_result.dart';
-import '../utils/geo_utils.dart';
 import '../../modules/travel/data/datasources/travel_request_remote_datasource.dart';
 import '../../modules/travel/data/models/route_point_model.dart';
 import '../../modules/travel/data/models/travel_request_model.dart';
 import 'distance_service.dart';
 import 'gps_gap_road_fill.dart';
+import 'road_aligned_route_service.dart';
 import 'sync_service.dart';
 import 'track_analytics.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
 
-/// Recomputes leg GPS km + allowance so list cards match detail/route paint.
+/// Recomputes leg GPS km + allowance so list cards / admin match the GPS trail.
 ///
-/// Home cards used stale API totals until the detail screen ran this logic.
+/// - Details open: [syncFromTrack] false — do not rewrite locked km.
+/// - Admin list / report: [syncFromTrack] true — recompute from route
+///   points once and PATCH server so everyone sees the same actual km.
 class TripRoadMetricsService {
   TripRoadMetricsService({
     TravelRequestRemoteDataSource? travelApi,
@@ -40,39 +43,42 @@ class TripRoadMetricsService {
   }
 
   /// Enhance one request from Hive/API GPS; persists + syncs when changed.
+  ///
+  /// [force] recomputes even when locked.
+  /// [syncFromTrack] refreshes completed-leg km from route points (admin/list).
   Future<TravelRequestModel> enhance(
     TravelRequestModel current, {
     bool persist = true,
+    bool force = false,
+    bool syncFromTrack = false,
   }) async {
-    if (!_needsEnhance(current)) {
+    if (!_needsEnhance(
+      current,
+      force: force,
+      syncFromTrack: syncFromTrack,
+    )) {
       return current.sanitizeAbsurdOfficialDistances().withRecalculatedSummary();
     }
 
-    final pointsRaw = await _hive.getRoutePointsForRequest(current.requestId);
-    var allPoints = pointsRaw.map(RoutePointModel.fromMap).toList();
-
-    if (allPoints.isEmpty && current.routePoints.isNotEmpty) {
-      allPoints =
-          current.routePoints.map(RoutePointModel.fromMap).toList();
-    }
-
-    final api = _api;
-    if (allPoints.isEmpty &&
-        api != null &&
-        current.restResourceId.isNotEmpty) {
-      try {
-        final res = await api.listRoutePoints(current.restResourceId);
-        if (res case ApiSuccess(:final data)) {
-          allPoints = data.map(RoutePointModel.fromMap).toList();
-        }
-      } catch (_) {}
-    }
-
+    final allPoints = await _loadAllRoutePoints(current);
     var updatedLegs = <TripLegModel>[];
     var changed = false;
 
     for (final leg in current.tripLegs) {
       if (leg.departurePunch == null) {
+        updatedLegs.add(leg);
+        continue;
+      }
+
+      final storedGps =
+          leg.provisionalDistanceKm ?? leg.actualDistanceKmFromTrack;
+
+      // Details mode: freeze completed legs that already have GPS km.
+      if (!force &&
+          !syncFromTrack &&
+          leg.arrivalPunch != null &&
+          storedGps != null &&
+          storedGps > 0.05) {
         updatedLegs.add(leg);
         continue;
       }
@@ -87,68 +93,96 @@ class TripRoadMetricsService {
         ..sort((a, b) => a.timestamp.compareTo(b.timestamp));
 
       if (legPoints.length >= 2) {
+        // Same road-align engine as the map — km matches what the user sees.
+        final alignInput = legPoints
+            .map(
+              (p) => GpsGapInputPoint(
+                lat: p.latitude,
+                lng: p.longitude,
+                time: p.timestamp,
+                source: p.source,
+                pointId: p.pointId,
+              ),
+            )
+            .toList(growable: false);
+        final aligned = await RoadAlignedRouteService().align(
+          gpsPoints: alignInput,
+          anchorStart: LatLng(
+            leg.departurePunch!.latitude,
+            leg.departurePunch!.longitude,
+          ),
+          anchorEnd: leg.arrivalPunch != null
+              ? LatLng(
+                  leg.arrivalPunch!.latitude,
+                  leg.arrivalPunch!.longitude,
+                )
+              : null,
+        );
+
+        var totalKm = aligned.isEmpty ? 0.0 : aligned.distanceKm;
+        var movingMinutes = 0;
+        var stoppedMinutes = 0;
+
+        // Moving/stopped minutes from raw GPS (legId-tolerant).
+        final legMetrics = TrackAnalytics.computeLegMetrics(
+          points: legPoints,
+          legId: leg.legId,
+          startInclusive: start,
+          endInclusive: end,
+          vehicleType: current.vehicleType,
+        );
+        movingMinutes = legMetrics.movingMinutes;
+        stoppedMinutes = legMetrics.stoppedMinutes;
+        if (totalKm <= 0.05 && legMetrics.distanceKm > 0.05) {
+          totalKm = legMetrics.distanceKm;
+        }
+
         final filled = await GpsGapRoadFill.fillRoutePoints(
           points: legPoints,
           legId: leg.legId,
           distanceService: _distance,
         );
-
-        var totalKm = 0.0;
-        var movingMinutes = 0;
-        var stoppedMinutes = 0;
-        final coords = <List<double>>[];
-
-        for (final seg in filled.segments) {
-          if (seg.isEmpty) continue;
-          if (seg.length < 2) {
-            coords.add([seg.first.latitude, seg.first.longitude]);
-            continue;
-          }
-          final segStart =
-              seg.first.timestamp.isBefore(start) ? start : seg.first.timestamp;
-          final segEnd =
-              seg.last.timestamp.isAfter(end) ? end : seg.last.timestamp;
-          final legMetrics = TrackAnalytics.computeLegMetrics(
-            points: seg,
-            legId: leg.legId,
-            startInclusive: segStart,
-            endInclusive: segEnd,
-            vehicleType: current.vehicleType,
-          );
-          totalKm += legMetrics.distanceKm;
-          movingMinutes += legMetrics.movingMinutes;
-          stoppedMinutes += legMetrics.stoppedMinutes;
-          for (final p in seg) {
-            coords.add([p.latitude, p.longitude]);
-          }
-        }
-
-        if (filled.roadFillMeters > 0) {
-          final fillerHaversineKm = _estimateFillerHaversineKm(filled.segments);
-          final directionsAwareKm =
-              totalKm - fillerHaversineKm + (filled.roadFillMeters / 1000.0);
-          if (directionsAwareKm > 0) totalKm = directionsAwareKm;
-        }
-
         if (filled.gapsFilled > 0) {
           unawaited(_persistGapFillersToHive(filled.segments));
+        }
+
+        final coords = <List<double>>[];
+        if (aligned.points.length >= 2) {
+          for (final p in aligned.points) {
+            coords.add([p.latitude, p.longitude]);
+          }
+        } else {
+          for (final seg in filled.segments) {
+            for (final p in seg) {
+              coords.add([p.latitude, p.longitude]);
+            }
+          }
         }
 
         final encodedPolyline = coords.isEmpty
             ? ''
             : coords.map((c) => '${c[0]},${c[1]}').join('|');
 
-        if (totalKm > 0 && encodedPolyline.isNotEmpty) {
-          final prev = leg.actualDistanceKmFromTrack ??
-              leg.provisionalDistanceKm ??
-              0;
-          if ((prev - totalKm).abs() > 0.05 ||
-              leg.routePolylineEncoded != encodedPolyline) {
+        if (totalKm > 0) {
+          final prev = storedGps ?? 0;
+          // Never overwrite a higher stored GPS km with a lower recompute
+          // (that was PATCHing 17.78 over the real ~20.5).
+          if (prev > 0.05 && totalKm < prev - 0.15 && !force) {
+            updatedLegs.add(leg);
+            continue;
+          }
+          final kmChanged = (prev - totalKm).abs() > 0.15;
+          final polyMissing = encodedPolyline.isNotEmpty &&
+              (leg.routePolylineEncoded == null ||
+                  leg.routePolylineEncoded!.isEmpty);
+          if (kmChanged || polyMissing || prev <= 0) {
             updatedLegs.add(
               leg.copyWith(
                 actualDistanceKmFromTrack: totalKm,
                 provisionalDistanceKm: totalKm,
-                routePolylineEncoded: encodedPolyline,
+                routePolylineEncoded: encodedPolyline.isNotEmpty
+                    ? encodedPolyline
+                    : leg.routePolylineEncoded,
                 trackMovingDurationMinutes: movingMinutes,
                 trackStoppedDurationMinutes: stoppedMinutes,
               ),
@@ -162,8 +196,8 @@ class TripRoadMetricsService {
       }
 
       final needsMetrics = leg.actualDistanceKmFromTrack == null ||
-          leg.routePolylineEncoded == null ||
-          leg.routePolylineEncoded!.isEmpty;
+          (leg.provisionalDistanceKm == null ||
+              leg.provisionalDistanceKm! <= 0);
 
       if (needsMetrics &&
           leg.arrivalPunch != null &&
@@ -196,26 +230,36 @@ class TripRoadMetricsService {
     }
 
     var updated = current.copyWith(tripLegs: updatedLegs);
-    updated = updated.sanitizeAbsurdOfficialDistances().withRecalculatedSummary();
+    updated =
+        updated.sanitizeAbsurdOfficialDistances().withRecalculatedSummary();
 
     if (changed ||
         (updated.totalDistanceKm - current.totalDistanceKm).abs() > 0.05 ||
         (updated.travelAllowance - current.travelAllowance).abs() > 0.5) {
-      if (persist) unawaited(_persist(updated));
+      if (persist) await _persist(updated);
       return updated;
     }
     return updated;
   }
 
-  /// Enhance many requests for list/home cards (sequential, non-blocking UI).
+  /// Enhance many requests for list/home/report cards.
   Future<List<TravelRequestModel>> enhanceAll(
     List<TravelRequestModel> requests, {
     bool persist = true,
+    bool force = false,
+    bool syncFromTrack = false,
   }) async {
     final out = <TravelRequestModel>[];
     for (final r in requests) {
       try {
-        out.add(await enhance(r, persist: persist));
+        out.add(
+          await enhance(
+            r,
+            persist: persist,
+            force: force,
+            syncFromTrack: syncFromTrack,
+          ),
+        );
       } catch (_) {
         out.add(r.sanitizeAbsurdOfficialDistances().withRecalculatedSummary());
       }
@@ -223,32 +267,68 @@ class TripRoadMetricsService {
     return out;
   }
 
-  bool _needsEnhance(TravelRequestModel r) {
+  Future<List<RoutePointModel>> _loadAllRoutePoints(
+    TravelRequestModel current,
+  ) async {
+    final pointsRaw = await _hive.getRoutePointsForRequest(current.requestId);
+    var allPoints = pointsRaw.map(RoutePointModel.fromMap).toList();
+
+    if (allPoints.isEmpty && current.routePoints.isNotEmpty) {
+      allPoints = current.routePoints.map(RoutePointModel.fromMap).toList();
+    }
+
+    final api = _api;
+    // Always prefer server trail for admin/list sync (user device Hive may be empty).
+    if (api != null && current.restResourceId.isNotEmpty) {
+      try {
+        final res = await api.listRoutePoints(current.restResourceId);
+        if (res case ApiSuccess(:final data)) {
+          final server = data.map(RoutePointModel.fromMap).toList();
+          if (server.length >= allPoints.length) {
+            allPoints = server;
+          } else if (allPoints.isEmpty) {
+            allPoints = server;
+          }
+        }
+      } catch (_) {}
+    }
+    return allPoints;
+  }
+
+  bool _needsEnhance(
+    TravelRequestModel r, {
+    bool force = false,
+    bool syncFromTrack = false,
+  }) {
     final s = r.status.trim();
     if (s == 'Ready To Start' || s == 'Start Missing' || s == 'Cancelled') {
       return false;
     }
-    return r.tripLegs.any((l) => l.departurePunch != null);
-  }
-
-  double _estimateFillerHaversineKm(List<List<RoutePointModel>> segments) {
-    var meters = 0.0;
-    for (final seg in segments) {
-      for (var i = 1; i < seg.length; i++) {
-        final a = seg[i - 1];
-        final b = seg[i];
-        if (a.source == GpsGapRoadFill.fillerSource ||
-            b.source == GpsGapRoadFill.fillerSource) {
-          meters += GeoUtils.distanceMeters(
-            a.latitude,
-            a.longitude,
-            b.latitude,
-            b.longitude,
-          );
-        }
-      }
+    if (force || syncFromTrack) {
+      return r.tripLegs.any((l) => l.departurePunch != null);
     }
-    return meters / 1000.0;
+
+    final inProgressTravel = r.tripLegs.any(
+      (l) => l.departurePunch != null && l.arrivalPunch == null,
+    );
+
+    final completed =
+        r.tripLegs.where((l) => l.arrivalPunch != null).toList();
+    if (!inProgressTravel &&
+        completed.isNotEmpty &&
+        completed.every((l) {
+          final g = l.provisionalDistanceKm ?? l.actualDistanceKmFromTrack;
+          return g != null && g > 0.05;
+        })) {
+      return false;
+    }
+
+    return r.tripLegs.any((l) {
+      if (l.departurePunch == null) return false;
+      final gps = l.provisionalDistanceKm ?? l.actualDistanceKmFromTrack;
+      if (l.arrivalPunch == null) return true;
+      return gps == null || gps <= 0.05;
+    });
   }
 
   Future<void> _persistGapFillersToHive(
@@ -289,13 +369,60 @@ class TripRoadMetricsService {
     try {
       await _hive.saveTravelRequest(updated.toMap());
       final api = _api;
-      if (api == null || updated.restResourceId.isEmpty) return;
-      await api.update(updated.restResourceId, {
-        'tripLegs': updated.tripLegs.map((l) => l.toMap()).toList(),
+      final id = updated.restResourceId;
+      if (api == null || id.isEmpty) {
+        debugPrint(
+          'TripRoadMetricsService: persist skipped '
+          '(api=${api != null} id="$id")',
+        );
+        return;
+      }
+
+      final legs = updated.tripLegs.map((l) {
+        final m = Map<String, dynamic>.from(l.toMap());
+        // Nest / older DTOs sometimes use short aliases.
+        if (l.provisionalDistanceKm != null) {
+          m['provisionalKm'] = l.provisionalDistanceKm;
+        }
+        if (l.actualDistanceKmFromTrack != null) {
+          m['trackKm'] = l.actualDistanceKmFromTrack;
+        }
+        if (l.officialDistanceKm != null) {
+          m['officialKm'] = l.officialDistanceKm;
+        }
+        return m;
+      }).toList();
+
+      final patch = <String, dynamic>{
+        'tripLegs': legs,
+        'stops': legs,
         'totalDistanceKm': updated.totalDistanceKm,
         'travelAllowance': updated.travelAllowance,
-        'updatedAt': DateTime.now().toIso8601String(),
-      });
-    } catch (_) {}
+        'updatedAt': DateTime.now().toUtc().toIso8601String(),
+      };
+
+      var result = await api.update(id, patch);
+      if (result is ApiFailure) {
+        debugPrint(
+          'TripRoadMetricsService: update() failed, retry patchTravelRequest: '
+          '${result.failureOrNull?.message}',
+        );
+        final retry = await api.patchTravelRequest(id, patch);
+        if (retry is ApiFailure) {
+          debugPrint(
+            'TripRoadMetricsService: PATCH km FAILED id=$id '
+            'km=${updated.totalDistanceKm.toStringAsFixed(2)} '
+            'err=${retry.failureOrNull?.message}',
+          );
+          return;
+        }
+      }
+      debugPrint(
+        'TripRoadMetricsService: PATCH km OK id=$id '
+        'km=${updated.totalDistanceKm.toStringAsFixed(2)}',
+      );
+    } catch (e) {
+      debugPrint('TripRoadMetricsService: persist exception: $e');
+    }
   }
 }

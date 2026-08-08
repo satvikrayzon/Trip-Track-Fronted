@@ -8,6 +8,7 @@ import '../theme/app_colors.dart';
 import '../theme/app_text_styles.dart';
 import '../../modules/travel/data/models/travel_request_model.dart';
 import '../utils/google_map_controller_utils.dart';
+import '../utils/map_marker_icon.dart';
 import 'app_card.dart';
 import 'google_map_web_gate.dart';
 import 'route_polyline_map_view.dart';
@@ -196,20 +197,53 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
       }
     }
 
+    final startPos = display.isNotEmpty
+        ? (tripMapStartMarkerTarget(
+              widget.request,
+              pathFirst: display.first,
+            ) ??
+            display.first)
+        : null;
+    final endPos = display.length > 1
+        ? (tripMapEndMarkerTarget(
+              widget.request,
+              pathLast: display.last,
+            ) ??
+            display.last)
+        : null;
+
     final markers = <Marker>{
-      if (display.isNotEmpty)
+      if (startPos != null)
         Marker(
           markerId: const MarkerId('route_start'),
-          position: display.first,
-          infoWindow: const InfoWindow(title: 'Start of path'),
+          position: startPos,
+          icon: mapStartMarkerIcon,
+          anchor: const Offset(0.5, 1.0),
+          infoWindow: const InfoWindow(title: 'Start'),
         ),
-      if (display.length > 1)
+      if (endPos != null &&
+          startPos != null &&
+          (endPos.latitude != startPos.latitude ||
+              endPos.longitude != startPos.longitude))
         Marker(
           markerId: const MarkerId('route_end'),
-          position: display.last,
-          infoWindow: const InfoWindow(title: 'End of path'),
+          position: endPos,
+          icon: mapEndMarkerIcon,
+          anchor: const Offset(0.5, 1.0),
+          infoWindow: const InfoWindow(title: 'End'),
         ),
+      ...tripStopMarkers(
+        widget.request,
+        exclude: [
+          if (startPos != null) startPos,
+          if (endPos != null) endPos,
+        ],
+      ),
     };
+
+    final stopPts = tripMapStops(widget.request)
+        .map((s) => s.position)
+        .toList();
 
     return ClipRRect(
       borderRadius: BorderRadius.circular(12),
@@ -221,6 +255,7 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
               fallback: RoutePolylineMapView(
                 points: display.isNotEmpty ? display : [center],
                 height: null,
+                stopPoints: stopPts,
               ),
               builder: (context) => GoogleMap(
                 initialCameraPosition: CameraPosition(

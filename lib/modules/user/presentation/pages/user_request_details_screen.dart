@@ -875,6 +875,13 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
         color: bg,
         borderRadius: BorderRadius.circular(14),
         border: Border.all(color: color.withValues(alpha: 0.35)),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x33000000),
+            blurRadius: 10,
+            offset: Offset(0, 3),
+          ),
+        ],
       ),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -932,14 +939,20 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
         onPressed:
             controller.isPunching.value ? null : controller.punchNextStep,
       );
-      if (reminder == null) return button;
+      final elevatedButton = Material(
+        elevation: 6,
+        shadowColor: Colors.black26,
+        borderRadius: BorderRadius.circular(14),
+        child: button,
+      );
+      if (reminder == null) return elevatedButton;
       return Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _buildPunchReminderBanner(reminder),
-          const SizedBox(height: 10),
-          button,
+          const SizedBox(height: 8),
+          elevatedButton,
         ],
       );
     }

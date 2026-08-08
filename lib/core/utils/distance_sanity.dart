@@ -41,9 +41,9 @@ class DistanceSanity {
     return false;
   }
 
-  /// Prefer sane official, else GPS / planned / punch distance.
-  /// When GPS track exists and official is meaningfully higher, prefer GPS —
-  /// Nest match often inflated card km until detail route reload.
+  /// Prefer GPS / provisional when a track exists so list cards, detail, and
+  /// allowance stay on one number. Nest "official" is only used when it matches
+  /// GPS closely or when no GPS km exists yet.
   static double? selectLegKm({
     double? officialKm,
     double? provisionalKm,
@@ -61,11 +61,10 @@ class DistanceSanity {
             gpsKm: gps,
             plannedKm: plannedKm,
             travelMinutes: travelMinutes,
-          )) {
-        // Official only when close to GPS; otherwise cards show inflated km.
-        if (officialKm <= gps * 1.25 || officialKm - gps <= 0.5) {
-          return officialKm;
-        }
+          ) &&
+          (officialKm - gps).abs() <= 0.15) {
+        // Same distance for practical purposes — keep official label value.
+        return officialKm;
       }
       return gps;
     }
@@ -82,5 +81,46 @@ class DistanceSanity {
     if (plannedKm != null && plannedKm > 0) return plannedKm;
     if (punchKm != null && punchKm > 0) return punchKm;
     return null;
+  }
+
+  /// Label for the value [selectLegKm] would return.
+  static String selectLegKmLabel({
+    double? officialKm,
+    double? provisionalKm,
+    double? trackKm,
+    double? plannedKm,
+    double? punchKm,
+    int? travelMinutes,
+  }) {
+    final chosen = selectLegKm(
+      officialKm: officialKm,
+      provisionalKm: provisionalKm,
+      trackKm: trackKm,
+      plannedKm: plannedKm,
+      punchKm: punchKm,
+      travelMinutes: travelMinutes,
+    );
+    if (chosen == null || chosen <= 0) return 'Distance';
+    final gps = provisionalKm ?? trackKm;
+    if (officialKm != null &&
+        officialKm > 0 &&
+        (chosen - officialKm).abs() <= 0.02 &&
+        !isOfficialAbsurd(
+          officialKm: officialKm,
+          gpsKm: gps,
+          plannedKm: plannedKm,
+          travelMinutes: travelMinutes,
+        )) {
+      return 'Official';
+    }
+    if (gps != null && gps > 0.05 && (chosen - gps).abs() <= 0.02) {
+      return 'Approx (GPS)';
+    }
+    if (plannedKm != null &&
+        plannedKm > 0 &&
+        (chosen - plannedKm).abs() <= 0.02) {
+      return 'Planned';
+    }
+    return 'Distance';
   }
 }

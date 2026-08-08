@@ -193,7 +193,9 @@ class RequestDetailsController {
     }
 
     seed = await enhanceRequestWithRoadMetrics(seed);
-    seed = await _enhanceWithOfficialMatch(seed);
+    // Official match is for map Layer B only — do not rematch on every open
+    // (that was rewriting km). Merge cached match without changing locked GPS.
+    seed = await _enhanceWithOfficialMatch(seed, rematchIfCompleted: false);
     seed = seed.sanitizeAbsurdOfficialDistances();
     request.value = seed;
     _syncPunchReminder(seed);
@@ -211,18 +213,19 @@ class RequestDetailsController {
   }
 
   Future<TravelRequestModel> _enhanceWithOfficialMatch(
-    TravelRequestModel current,
-  ) async {
+    TravelRequestModel current, {
+    bool rematchIfCompleted = false,
+  }) async {
     if (!ServiceLocator.I.has<MapMatchingService>()) return current;
     try {
       final matcher = ServiceLocator.I.get<MapMatchingService>();
       final updated = await matcher.enhanceWithOfficialMatch(current);
 
-      // Completed trips: always rematch so Nest Directions gap-fill rebuilds
-      // the official road polyline (old matches still store straight chords).
+      // Rematch only when explicitly requested (e.g. trip just ended) — not
+      // every details open.
       final completed = updated.status == AppConstants.statusCompleted ||
           updated.tripEndedAt != null;
-      if (completed) {
+      if (rematchIfCompleted && completed) {
         final id = updated.restResourceId.isNotEmpty
             ? updated.restResourceId
             : updated.requestId;
@@ -513,7 +516,10 @@ class RequestDetailsController {
       case ApiSuccess(:final data):
         final parsed = TravelRequestModel.fromMap(data);
         var enhanced = await enhanceRequestWithRoadMetrics(parsed);
-        enhanced = await _enhanceWithOfficialMatch(enhanced);
+        enhanced = await _enhanceWithOfficialMatch(
+          enhanced,
+          rematchIfCompleted: false,
+        );
         enhanced = enhanced.sanitizeAbsurdOfficialDistances();
         await _applyRemoteTrip(enhanced);
       case ApiFailure(:final failure):
@@ -794,8 +800,14 @@ class RequestDetailsController {
           trackingStatus: trackStatus,
         );
 
+        // Calculate GPS km once after arrival (only fills missing); persist to server.
         updatedRequest = await enhanceRequestWithRoadMetrics(updatedRequest);
-        updatedRequest = await _enhanceWithOfficialMatch(updatedRequest);
+        updatedRequest = await _enhanceWithOfficialMatch(
+          updatedRequest,
+          rematchIfCompleted: punchType == 'travel_arrival' &&
+              (updatedRequest.activeLeg?.isReturnLeg == true ||
+                  updatedRequest.status == AppConstants.statusCompleted),
+        );
         updatedRequest = updatedRequest.sanitizeAbsurdOfficialDistances();
         request.value = updatedRequest;
         await _hiveDb.saveTravelRequest(updatedRequest.toMap());
@@ -1032,7 +1044,18 @@ class RequestDetailsController {
     if (!ServiceLocator.I.has<TripRoadMetricsService>()) {
       return current.sanitizeAbsurdOfficialDistances().withRecalculatedSummary();
     }
-    return ServiceLocator.I.get<TripRoadMetricsService>().enhance(current);
+    // Don't re-run Snap/Directions on every details open when km already exists —
+    // that made the screen feel stuck while the map also aligned.
+    final needsKm = current.tripLegs.any((l) {
+      if (l.departurePunch == null) return false;
+      final gps = l.provisionalDistanceKm ?? l.actualDistanceKmFromTrack;
+      return gps == null || gps <= 0.05;
+    });
+    return ServiceLocator.I.get<TripRoadMetricsService>().enhance(
+      current,
+      persist: true,
+      syncFromTrack: needsKm,
+    );
   }
 
   String? _nextPunchType(TripLegModel leg) {
