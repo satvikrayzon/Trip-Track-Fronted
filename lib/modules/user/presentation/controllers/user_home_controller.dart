@@ -373,17 +373,25 @@ class UserHomeController {
     final isTrackingActive =
         (trip.status == 'Travelling' || trip.status == 'Returning') ||
             trip.trackingStatus == 'tracking';
-    if (isTrackingActive) {
-      final bg = ServiceLocator.I.get<BackgroundLocationService>();
-      if (!bg.isRunning) {
-        final session = ServiceLocator.I.get<TrackingSessionService>();
-        unawaited(session.onTravelDeparture(
-          requestId: trip.requestId,
-          legId: trip.activeLeg?.legId ?? '',
-          sessionId: trip.trackingSessionId ?? '',
-        ));
-      }
-    }
+    if (!isTrackingActive) return;
+
+    final bg = ServiceLocator.I.get<BackgroundLocationService>();
+    final stale = bg.recentTrackerFix(maxAge: const Duration(seconds: 90));
+    if (bg.isRunning && stale != null) return;
+
+    final session = ServiceLocator.I.get<TrackingSessionService>();
+    final requestId =
+        trip.requestId.isNotEmpty ? trip.requestId : trip.restResourceId;
+    final legId = trip.activeLeg?.legId ??
+        (trip.tripLegs.isNotEmpty ? trip.tripLegs.first.legId : '');
+    final sessionId = trip.trackingSessionId ?? '';
+    if (requestId.isEmpty || legId.isEmpty) return;
+
+    unawaited(session.onTravelDeparture(
+      requestId: requestId,
+      legId: legId,
+      sessionId: sessionId.isNotEmpty ? sessionId : requestId,
+    ));
   }
 
   Future<Map<String, TravelRequestModel>> _hiveIndex(String userId) async {

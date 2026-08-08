@@ -1,21 +1,34 @@
-import 'package:permission_handler/permission_handler.dart';
+import 'package:geolocator/geolocator.dart';
 
 /// Foreground + background location for live trip tracking.
+///
+/// Uses Geolocator (same stack as punch GPS) so iOS permission prompts work
+/// without relying on permission_handler preprocessor macros.
 class LocationPermissionService {
   static Future<bool> ensureForLiveTracking() async {
-    var whenInUse = await Permission.locationWhenInUse.status;
-    if (!whenInUse.isGranted) {
-      whenInUse = await Permission.locationWhenInUse.request();
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      await Geolocator.openLocationSettings();
+      if (!await Geolocator.isLocationServiceEnabled()) return false;
     }
-    if (!whenInUse.isGranted) {
+
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+    if (permission == LocationPermission.deniedForever) {
       return false;
     }
 
-    var always = await Permission.locationAlways.status;
-    if (!always.isGranted) {
-      always = await Permission.locationAlways.request();
+    // iOS: second request can upgrade When In Use → Always for background tracking.
+    if (permission == LocationPermission.whileInUse) {
+      final upgraded = await Geolocator.requestPermission();
+      if (upgraded == LocationPermission.always ||
+          upgraded == LocationPermission.whileInUse) {
+        permission = upgraded;
+      }
     }
 
-    return always.isGranted || whenInUse.isGranted;
+    return permission == LocationPermission.always ||
+        permission == LocationPermission.whileInUse;
   }
 }

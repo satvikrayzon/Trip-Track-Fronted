@@ -178,15 +178,24 @@ class RequestDetailsController {
             seed.status == 'Returning' ||
             seed.trackingStatus == 'tracking') {
           final bg = ServiceLocator.I.get<BackgroundLocationService>();
-          if (!bg.isRunning) {
+          final stale =
+              bg.recentTrackerFix(maxAge: const Duration(seconds: 90));
+          if (!bg.isRunning || stale == null) {
             final session = ServiceLocator.I.get<TrackingSessionService>();
-            unawaited(session.onTravelDeparture(
-              requestId: seed.requestId,
-              legId: seed.activeLeg?.legId ??
-                  seed.tripLegs.firstOrNull?.legId ??
-                  '',
-              sessionId: seed.trackingSessionId ?? '',
-            ));
+            final requestId = seed.requestId.isNotEmpty
+                ? seed.requestId
+                : seed.restResourceId;
+            final legId = seed.activeLeg?.legId ??
+                seed.tripLegs.firstOrNull?.legId ??
+                '';
+            final sessionId = seed.trackingSessionId ?? '';
+            if (requestId.isNotEmpty && legId.isNotEmpty) {
+              unawaited(session.onTravelDeparture(
+                requestId: requestId,
+                legId: legId,
+                sessionId: sessionId.isNotEmpty ? sessionId : requestId,
+              ));
+            }
           }
         }
       }
@@ -286,7 +295,7 @@ class RequestDetailsController {
     var updated = current;
     var changed = false;
 
-    if (updated.startCoordinates == null) {
+    if (GeoUtils.validCoordinates(updated.startCoordinates) == null) {
       final resolved = await _punchLocation.resolveStartCoordinates(updated);
       if (resolved != null) {
         updated = updated.copyWith(startCoordinates: resolved);
@@ -294,7 +303,7 @@ class RequestDetailsController {
       }
     }
 
-    if (updated.endCoordinates == null) {
+    if (GeoUtils.validCoordinates(updated.endCoordinates) == null) {
       final leg = updated.activeLeg ??
           (updated.tripLegs.isNotEmpty ? updated.tripLegs.first : null);
       if (leg != null) {
@@ -324,8 +333,8 @@ class RequestDetailsController {
     final apiId = updated.restResourceId;
     if (apiId.isNotEmpty) {
       final patch = <String, dynamic>{};
-      final start = updated.startCoordinates;
-      final end = updated.endCoordinates;
+      final start = GeoUtils.validCoordinates(updated.startCoordinates);
+      final end = GeoUtils.validCoordinates(updated.endCoordinates);
       if (start != null) {
         patch['originLat'] = start['latitude'];
         patch['originLng'] = start['longitude'];
@@ -360,33 +369,45 @@ class RequestDetailsController {
 
     final ws = ServiceLocator.I.get<WebSocketTrackingService>();
     ws.joinTripRoom(requestId);
+    final cur = request.value;
+    if (cur != null) {
+      if (cur.restResourceId.isNotEmpty && cur.restResourceId != requestId) {
+        ws.joinTripRoom(cur.restResourceId);
+      }
+      if (cur.tripId.isNotEmpty && cur.tripId != requestId) {
+        ws.joinTripRoom(cur.tripId);
+      }
+    }
     _locationSub?.cancel();
     _locationSub = ws.locationUpdates.listen((payload) {
-      final tid = payload['tripId'] ?? payload['requestId'];
-      if (tid == requestId) {
-        final lat = (payload['latitude'] as num?)?.toDouble();
-        final lng = (payload['longitude'] as num?)?.toDouble();
-        if (lat != null && lng != null) {
-          final latLng = LatLng(lat, lng);
-          final currentPath = List<LatLng>.from(adminLivePath.value);
-          // Drop live teleports so the map cannot paint ocean lines.
-          if (currentPath.isNotEmpty) {
-            final prev = currentPath.last;
-            final jump = GeoUtils.distanceMeters(
-              prev.latitude,
-              prev.longitude,
-              lat,
-              lng,
-            );
-            if (jump > 2500) return;
-          }
-          if (currentPath.isEmpty || currentPath.last != latLng) {
-            currentPath.add(latLng);
-            adminLivePath.value = currentPath;
-            // Do NOT rewrite request.routePoints every GPS tick — that rebuilt
-            // the whole map (loader + erase). Trail paint appends from adminLivePath.
-          }
-        }
+      final tid = (payload['tripId'] ?? payload['requestId'])?.toString() ?? '';
+      final current = request.value;
+      if (tid.isEmpty || current == null) return;
+      if (!tripMatchesRealtimeKey(current, tid) && tid != requestId) return;
+
+      final lat = (payload['latitude'] as num?)?.toDouble();
+      final lng = (payload['longitude'] as num?)?.toDouble();
+      if (lat == null || lng == null || !GeoUtils.isValidLatLng(lat, lng)) {
+        return;
+      }
+      final latLng = LatLng(lat, lng);
+      final currentPath = List<LatLng>.from(adminLivePath.value);
+      // Drop live teleports so the map cannot paint ocean lines.
+      if (currentPath.isNotEmpty) {
+        final prev = currentPath.last;
+        final jump = GeoUtils.distanceMeters(
+          prev.latitude,
+          prev.longitude,
+          lat,
+          lng,
+        );
+        if (jump > 2500) return;
+      }
+      if (currentPath.isEmpty || currentPath.last != latLng) {
+        currentPath.add(latLng);
+        adminLivePath.value = currentPath;
+        // Do NOT rewrite request.routePoints every GPS tick — that rebuilt
+        // the whole map (loader + erase). Trail paint appends from adminLivePath.
       }
     });
 
@@ -394,9 +415,19 @@ class RequestDetailsController {
     _connSubDetail = ws.connectionStream.listen((connected) {
       if (connected) {
         ws.joinTripRoom(requestId);
-        _adminLiveMapTimer?.cancel();
-        _adminLiveMapTimer = null;
+        final live = request.value;
+        if (live != null) {
+          if (live.restResourceId.isNotEmpty) {
+            ws.joinTripRoom(live.restResourceId);
+          }
+          if (live.tripId.isNotEmpty) {
+            ws.joinTripRoom(live.tripId);
+          }
+        }
         unawaited(_refreshAdminLivePath());
+        // Keep a safety poll even while socket is up — location events can
+        // be dropped after reconnect until rooms rejoin fully.
+        _syncAdminLiveMapTimer(request.value);
       } else {
         _syncAdminLiveMapTimer(request.value);
       }
@@ -450,10 +481,11 @@ class RequestDetailsController {
     // Load trail immediately for admin review (completed or live trips).
     unawaited(_refreshAdminLivePath());
 
-    final ws = ServiceLocator.I.get<WebSocketTrackingService>();
-    if (_shouldPollServerTrail(r) && !ws.isConnected) {
+    if (_shouldPollServerTrail(r)) {
+      // Always poll for live trips. Socket tips can stall after offline→online
+      // even when ws.isConnected is true.
       _adminLiveMapTimer ??= Timer.periodic(
-        const Duration(seconds: 20),
+        const Duration(seconds: 15),
         (_) => unawaited(_refreshAdminLivePath()),
       );
     } else {
@@ -730,7 +762,10 @@ class RequestDetailsController {
     if (punchType == 'travel_departure' && live) {
       final ok = await LocationPermissionService.ensureForLiveTracking();
       if (!ok) {
-        _showError('Location permission is required for live trip tracking');
+        _showError(
+          'Location permission is required for live trip tracking. '
+          'Enable Location for Trip Track in Settings (While Using or Always), then try again.',
+        );
         return;
       }
     }

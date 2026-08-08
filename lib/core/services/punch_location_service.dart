@@ -99,18 +99,12 @@ class PunchLocationService {
   Future<Map<String, double>?> resolveStartCoordinates(
     TravelRequestModel request,
   ) async {
-    final existing = request.startCoordinates;
-    if (existing != null) {
-      final lat = existing['latitude'];
-      final lng = existing['longitude'];
-      if (lat != null && lng != null) {
-        return {'latitude': lat, 'longitude': lng};
-      }
-    }
+    final existing = GeoUtils.validCoordinates(request.startCoordinates);
+    if (existing != null) return existing;
 
     final from = request.fromLocation.trim();
     if (from.isEmpty) return null;
-    return _resolveCoordinatesForAddress(from);
+    return GeoUtils.validCoordinates(await _resolveCoordinatesForAddress(from));
   }
 
   /// Anchor used for the 500m Start Departure geofence.
@@ -254,39 +248,40 @@ class PunchLocationService {
   ) async {
     // If it is the return leg, the destination is the starting point of the trip
     if (leg.isReturnLeg) {
-      final start = request.startCoordinates;
-      if (start != null) {
-        final lat = start['latitude'];
-        final lng = start['longitude'];
-        if (lat != null && lng != null) {
-          return {'latitude': lat, 'longitude': lng};
-        }
-      }
+      final start = GeoUtils.validCoordinates(request.startCoordinates);
+      if (start != null) return start;
       final to = leg.toLocation.trim().isNotEmpty
           ? leg.toLocation.trim()
           : request.fromLocation.trim();
-      return _resolveCoordinatesForAddress(to);
+      return GeoUtils.validCoordinates(await _resolveCoordinatesForAddress(to));
     }
 
-    // For intermediate legs in a multi-leg trip, we must geocode the leg's planned destination address
-    // (do not use request.endCoordinates because that represents the final destination of the entire trip).
-    // Only use request.endCoordinates if it is a single-leg trip.
+    final end = GeoUtils.validCoordinates(request.endCoordinates);
     final isMultiLeg = request.tripLegs.length > 1;
-    if (!isMultiLeg) {
-      final existing = request.endCoordinates;
-      if (existing != null) {
-        final lat = existing['latitude'];
-        final lng = existing['longitude'];
-        if (lat != null && lng != null) {
-          return {'latitude': lat, 'longitude': lng};
-        }
-      }
+    final legTo = leg.toLocation.trim();
+    final requestTo = request.toLocation.trim();
+    final matchesTripDestination = legTo.isNotEmpty &&
+        requestTo.isNotEmpty &&
+        (legTo.toLowerCase() == requestTo.toLowerCase() ||
+            legTo.toLowerCase().contains(requestTo.toLowerCase()) ||
+            requestTo.toLowerCase().contains(legTo.toLowerCase()));
+
+    // Prefer map-picked coords whenever this leg is the trip destination.
+    // Avoids bad address geocodes (e.g. "rayzon Solar" → lat≈0).
+    if (end != null &&
+        (!isMultiLeg ||
+            matchesTripDestination ||
+            (!leg.isReturnLeg && leg.sequence <= 1))) {
+      return end;
     }
 
-    final to = leg.toLocation.trim().isNotEmpty
-        ? leg.toLocation.trim()
-        : request.toLocation.trim();
-    return _resolveCoordinatesForAddress(to);
+    final to = legTo.isNotEmpty ? legTo : requestTo;
+    final geocoded =
+        GeoUtils.validCoordinates(await _resolveCoordinatesForAddress(to));
+    if (geocoded != null) return geocoded;
+
+    // Last resort: still use trip end coords if they are valid.
+    return end;
   }
 
   /// Reverse-geocode GPS into a human-readable address for punch records.
@@ -337,14 +332,15 @@ class PunchLocationService {
     var updated = request;
     final activeLeg = leg ?? request.activeLeg;
 
-    if (updated.startCoordinates == null) {
+    if (GeoUtils.validCoordinates(updated.startCoordinates) == null) {
       final start = await resolveStartCoordinates(updated);
       if (start != null) {
         updated = updated.copyWith(startCoordinates: start);
       }
     }
 
-    if (activeLeg != null && updated.endCoordinates == null) {
+    if (activeLeg != null &&
+        GeoUtils.validCoordinates(updated.endCoordinates) == null) {
       final end = await resolveDestinationCoordinates(updated, activeLeg);
       if (end != null) {
         updated = updated.copyWith(endCoordinates: end);
@@ -356,8 +352,8 @@ class PunchLocationService {
 
   Map<String, dynamic> plannedCoordinatePatch(TravelRequestModel request) {
     final patch = <String, dynamic>{};
-    final start = request.startCoordinates;
-    final end = request.endCoordinates;
+    final start = GeoUtils.validCoordinates(request.startCoordinates);
+    final end = GeoUtils.validCoordinates(request.endCoordinates);
     if (start != null) {
       patch['originLat'] = start['latitude'];
       patch['originLng'] = start['longitude'];
@@ -377,20 +373,46 @@ class PunchLocationService {
     required double userLng,
   }) async {
     if (bypassGeofenceChecks) return null;
-    final destination = await resolveDestinationCoordinates(request, leg);
+    if (!GeoUtils.isValidLatLng(userLat, userLng)) {
+      return 'Could not read your GPS position. Wait a moment and try again.';
+    }
+
+    var destination = await resolveDestinationCoordinates(request, leg);
+    destination = GeoUtils.validCoordinates(destination);
+
+    // Prefer map-picked end coords when resolve produced nothing / invalid.
+    destination ??= GeoUtils.validCoordinates(request.endCoordinates);
+
     if (destination == null) {
       return 'Could not verify the destination. '
           'Re-open this trip or recreate the request with map search.';
     }
 
-    final destLat = destination['latitude']!;
-    final destLng = destination['longitude']!;
-    final distance = GeoUtils.distanceMeters(
+    var destLat = destination['latitude']!;
+    var destLng = destination['longitude']!;
+    var distance = GeoUtils.distanceMeters(
       userLat,
       userLng,
       destLat,
       destLng,
     );
+
+    // If primary dest looks absurdly far, try map-picked endCoordinates.
+    final end = GeoUtils.validCoordinates(request.endCoordinates);
+    if (distance > 50000 && end != null) {
+      final alt = GeoUtils.distanceMeters(
+        userLat,
+        userLng,
+        end['latitude']!,
+        end['longitude']!,
+      );
+      if (alt < distance) {
+        destLat = end['latitude']!;
+        destLng = end['longitude']!;
+        distance = alt;
+      }
+    }
+
     const radius = AppConstants.arrivalGeofenceRadiusMeters;
 
     if (distance <= radius) return null;

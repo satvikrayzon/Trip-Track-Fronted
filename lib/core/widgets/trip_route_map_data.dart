@@ -427,7 +427,8 @@ Future<
 
   final hasServerOrLocal = allPointsMap.isNotEmpty;
 
-  // 4) Merge unsynced local GPS when we already have a base trail.
+  // 4) Merge local Hive GPS (including recently synced points). After
+  // reconnect, server trail can lag behind device GPS that was already acked.
   if (hasServerOrLocal) {
     try {
       final hive = await HiveDatabase.instance
@@ -435,7 +436,6 @@ Future<
       for (final raw in hive) {
         final m = Map<String, dynamic>.from(raw);
         final source = m['source']?.toString() ?? '';
-        if (m['isSynced'] == true) continue;
         if (source == GpsGapRoadFill.fillerSource ||
             source == 'gap_resume' ||
             source.contains('gap')) {

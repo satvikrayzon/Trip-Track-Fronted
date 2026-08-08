@@ -147,10 +147,15 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
 
   /// Tip signature for lightweight live append (not full Snap reload).
   String _liveTipKey() {
-    final bgCount =
-        (_bgLocationService?.activeRequestId == widget.request.requestId)
-            ? _bgLocationService?.pointsBuffered.value ?? 0
-            : 0;
+    final bgCount = _isActiveLocalTrip()
+        ? _bgLocationService?.pointsBuffered.value ?? 0
+        : 0;
+    // Include device tip coords so offline updates aren't ignored when the
+    // requestId used by BackgroundLocationService differs from widget.requestId.
+    final tip = _latestLiveTip();
+    final tipSig = tip == null
+        ? '0'
+        : '${tip.latitude.toStringAsFixed(5)},${tip.longitude.toStringAsFixed(5)}';
     final admin = widget.adminServerPath;
     final adminTip = (admin != null && admin.isNotEmpty)
         ? '${admin.length}|${admin.last.latitude}|${admin.last.longitude}'
@@ -160,10 +165,11 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     final lastSig = last == null
         ? '0'
         : '${last['latitude']}|${last['longitude']}|${pts.length}';
-    return 'bg:$bgCount|srv:$adminTip|rp:$lastSig';
+    return 'tip:$tipSig|bg:$bgCount|srv:$adminTip|rp:$lastSig';
   }
 
   String _lastLiveTipKey = '';
+  Timer? _offlineLiveTipTimer;
 
   List<List<List<LatLng>>>? get _activePoints {
     // Always prefer gap-filled resolved paths. Admin live LatLng lists used to
@@ -192,16 +198,37 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       _bgLocationService = ServiceLocator.I.get<BackgroundLocationService>();
       _bgLocationService?.pointsBuffered.addListener(_onLocalPointsUpdated);
     }
+    _syncOfflineLiveTipTimer();
     _syncRouteLoad();
     _syncMatchedLoad();
   }
 
+  void _syncOfflineLiveTipTimer() {
+    _offlineLiveTipTimer?.cancel();
+    _offlineLiveTipTimer = null;
+    if (!_isLiveTrip) return;
+    // Offline has no websocket tips — poll device GPS so the polyline keeps
+    // moving even when pointsBuffered listeners miss an id mismatch.
+    _offlineLiveTipTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (!mounted || !_isLiveTrip) return;
+      _applyLiveTipAppend();
+    });
+  }
+
   Timer? _localPointsDebounce;
 
+  bool _isActiveLocalTrip() {
+    final activeId = _bgLocationService?.activeRequestId;
+    if (activeId == null || activeId.isEmpty) return false;
+    final r = widget.request;
+    return activeId == r.requestId ||
+        activeId == r.restResourceId ||
+        activeId == r.tripId ||
+        (r.mongoDocumentId != null && activeId == r.mongoDocumentId);
+  }
+
   void _onLocalPointsUpdated() {
-    if (_bgLocationService?.activeRequestId != widget.request.requestId) {
-      return;
-    }
+    if (!_isActiveLocalTrip()) return;
     _scheduleLiveTipUpdate();
   }
 
@@ -218,6 +245,21 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   }
 
   LatLng? _latestLiveTip() {
+    // Prefer the device GPS stream so the tip keeps moving after offline,
+    // reconnect, or kill/reopen — even when server/admin path is stale.
+    if (_isActiveLocalTrip()) {
+      final fix = _bgLocationService?.recentTrackerFix(
+        maxAge: const Duration(minutes: 2),
+      );
+      final lat = fix?.latitude;
+      final lng = fix?.longitude;
+      if (lat != null &&
+          lng != null &&
+          GeoUtils.isValidLatLng(lat, lng)) {
+        return LatLng(lat, lng);
+      }
+    }
+
     final admin = widget.adminServerPath;
     if (admin != null && admin.isNotEmpty) return admin.last;
     final pts = widget.request.routePoints;
@@ -228,18 +270,32 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     final lng = (last['longitude'] as num?)?.toDouble() ??
         (last['lng'] as num?)?.toDouble();
     if (lat == null || lng == null) return null;
+    if (!GeoUtils.isValidLatLng(lat, lng)) return null;
     return LatLng(lat, lng);
   }
 
   void _applyLiveTipAppend() {
     final tip = _latestLiveTip();
-    if (tip == null || _resolvedPoints == null) return;
+    if (tip == null) return;
+
+    // Offline / first fix: bootstrap a trail from device GPS immediately.
+    if (_resolvedPoints == null || _resolvedPoints!.isEmpty) {
+      final tipKey = _liveTipKey();
+      if (tipKey == _lastLiveTipKey) return;
+      _lastLiveTipKey = tipKey;
+      setState(() => _resolvedPoints = [
+            [
+              [tip]
+            ]
+          ]);
+      _followLiveCamera(tip);
+      return;
+    }
+
     final tipKey = _liveTipKey();
     if (tipKey == _lastLiveTipKey) return;
-    _lastLiveTipKey = tipKey;
 
     final paths = _resolvedPoints!;
-    if (paths.isEmpty) return;
     final legIndex =
         widget.request.currentLegIndex.clamp(0, paths.length - 1);
     final leg = paths[legIndex];
@@ -254,6 +310,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
           else
             paths[i],
       ];
+      _lastLiveTipKey = tipKey;
       setState(() => _resolvedPoints = next);
       _followLiveCamera(tip);
       return;
@@ -267,8 +324,19 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       tip.longitude,
     );
     if (jump < 4) return;
+    _lastLiveTipKey = tipKey;
+
     if (jump > GpsGapRoadFill.breakChordMeters) {
-      // Kill/reopen hop — full reload, keep old trail until ready.
+      // Large hop (kill/reopen or GPS gap): start a new segment with the tip
+      // so the map keeps updating offline — don't wait on network reload.
+      final newLeg = [...leg, [tip]];
+      setState(() {
+        _resolvedPoints = [
+          for (var i = 0; i < paths.length; i++)
+            if (i == legIndex) newLeg else paths[i],
+        ];
+      });
+      _followLiveCamera(tip);
       evictRoutePointsCache(widget.request.requestId);
       _routePointsCacheKey = '';
       _syncRouteLoad(keepPrevious: true);
@@ -345,6 +413,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     }
     _syncRouteLoad(keepPrevious: !tripChanged);
     _syncMatchedLoad();
+    _syncOfflineLiveTipTimer();
     // Live tip: append smoothly; do not fit whole route every tick.
     if (!tripChanged && (_isLiveTrip || _isLiveServer)) {
       _scheduleLiveTipUpdate();
@@ -457,6 +526,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   @override
   void dispose() {
     _bgLocationService?.pointsBuffered.removeListener(_onLocalPointsUpdated);
+    _offlineLiveTipTimer?.cancel();
     _localPointsDebounce?.cancel();
     _liveReloadDebounce?.cancel();
     _mapPaddingDebounce?.cancel();

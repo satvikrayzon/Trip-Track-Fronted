@@ -1,5 +1,6 @@
 import '../../../core/constants/app_constants.dart';
 import '../../../core/models/picked_location.dart';
+import '../../../core/utils/geo_utils.dart';
 import '../data/models/travel_request_model.dart';
 
 /// Whether the trip is in progress (started but not completed).
@@ -96,7 +97,7 @@ PickedLocation? pickedLocationForLegField({
 
   final lat = coordinates?['latitude'];
   final lng = coordinates?['longitude'];
-  if (lat != null && lng != null) {
+  if (lat != null && lng != null && GeoUtils.isValidLatLng(lat, lng)) {
     return PickedLocation(
       name: (displayName?.trim().isNotEmpty == true) ? displayName!.trim() : trimmed,
       formattedAddress: trimmed,
@@ -105,6 +106,7 @@ PickedLocation? pickedLocationForLegField({
     );
   }
 
+  // Address-only placeholder. Callers must not PATCH (0,0) to the API.
   return PickedLocation(
     name: (displayName?.trim().isNotEmpty == true) ? displayName!.trim() : trimmed,
     formattedAddress: trimmed,

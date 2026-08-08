@@ -8,6 +8,7 @@ import '../../../../core/models/picked_location.dart';
 import '../../../../core/network/models/api_result.dart';
 import '../../../../core/routes/app_routes.dart';
 import '../../../../core/services/active_trip_restore_service.dart';
+import '../../../../core/utils/geo_utils.dart';
 import '../../../travel/data/datasources/travel_request_remote_datasource.dart';
 import '../../../travel/data/models/travel_request_model.dart';
 import '../../../travel/utils/travel_request_edit_utils.dart';
@@ -175,8 +176,14 @@ class CreateRequestController {
           })
               .ensureTripLegs()
               .copyWith(
-                startCoordinates: from.toCoordinatesMap(),
-                endCoordinates: to.toCoordinatesMap(),
+                startCoordinates:
+                    GeoUtils.isValidLatLng(from.latitude, from.longitude)
+                        ? from.toCoordinatesMap()
+                        : null,
+                endCoordinates:
+                    GeoUtils.isValidLatLng(to.latitude, to.longitude)
+                        ? to.toCoordinatesMap()
+                        : null,
                 startAddress: from.name,
                 endAddress: to.name,
               );
@@ -273,10 +280,14 @@ class CreateRequestController {
         patch['fuelType'] = selectedFuelType.value;
       }
 
-      patch['originLat'] = from.latitude;
-      patch['originLng'] = from.longitude;
-      patch['destinationLat'] = to.latitude;
-      patch['destinationLng'] = to.longitude;
+      if (GeoUtils.isValidLatLng(from.latitude, from.longitude)) {
+        patch['originLat'] = from.latitude;
+        patch['originLng'] = from.longitude;
+      }
+      if (GeoUtils.isValidLatLng(to.latitude, to.longitude)) {
+        patch['destinationLat'] = to.latitude;
+        patch['destinationLng'] = to.longitude;
+      }
 
       final result = await _travelApi.patchTravelRequest(
         original.restResourceId,
@@ -289,8 +300,14 @@ class CreateRequestController {
               .ensureTripLegs()
               .mergePreservingLocalProgress(original)
               .copyWith(
-                startCoordinates: from.toCoordinatesMap(),
-                endCoordinates: to.toCoordinatesMap(),
+                startCoordinates:
+                    GeoUtils.isValidLatLng(from.latitude, from.longitude)
+                        ? from.toCoordinatesMap()
+                        : original.startCoordinates,
+                endCoordinates:
+                    GeoUtils.isValidLatLng(to.latitude, to.longitude)
+                        ? to.toCoordinatesMap()
+                        : original.endCoordinates,
                 startAddress: from.name,
                 endAddress: to.name,
                 clientName: trimmedClient,

@@ -49,6 +49,8 @@
 	<string>Trip Track needs your location to record live travel distance and route while you are on a trip.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>Background location allows continuous trip tracking until your trip ends. You can change this in Settings.</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+	<string>Background location allows continuous trip tracking until your trip ends. You can change this in Settings.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>
