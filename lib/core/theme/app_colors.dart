@@ -14,6 +14,21 @@ class AppColors {
   static const Color accentLight = Color(0xFF4DD0E1);
   static const Color accentDark = Color(0xFF0097A7);
 
+  /// Distinct trail colors per trip leg (leg 0 = primary brand).
+  static const List<Color> legTrailColors = [
+    primary,
+    Color(0xFFE65100), // deep orange
+    Color(0xFF6A1B9A), // purple
+    Color(0xFF2E7D32), // green
+    Color(0xFFC62828), // red
+    Color(0xFF1565C0), // blue
+    Color(0xFF00838F), // cyan
+    Color(0xFF4E342E), // brown
+  ];
+
+  static Color legTrailColor(int legIndex) =>
+      legTrailColors[legIndex % legTrailColors.length];
+
   // Neutral Colors
   static const Color white = Color(0xFFFFFFFF);
   static const Color black = Color(0xFF000000);

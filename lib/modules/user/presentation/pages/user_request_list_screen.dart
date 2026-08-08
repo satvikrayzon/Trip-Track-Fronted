@@ -15,9 +15,6 @@ import '../../../../core/widgets/header_widget.dart';
 import '../../../travel/data/models/travel_request_model.dart';
 import '../../../travel/utils/travel_request_delete_utils.dart';
 import '../../../travel/utils/travel_request_edit_utils.dart';
-import '../../../../core/services/active_trip_restore_service.dart';
-import '../../../../core/di/service_locator.dart';
-import '../../../travel/data/datasources/travel_request_remote_datasource.dart';
 import '../controllers/user_requests_controller.dart';
 
 /// User Request List Screen
@@ -370,19 +367,6 @@ class _UserRequestListScreenState extends State<UserRequestListScreen> {
   }
 
   Future<void> _handleCreateRequest() async {
-    final restore = ActiveTripRestoreService(
-      ServiceLocator.I.get<TravelRequestRemoteDataSource>(),
-    );
-    final active = await restore.resolveActiveTrip();
-    if (!mounted) return;
-    if (blocksNewTravelRequest(active)) {
-      showAppSnackBar(
-        title: 'Trip In Progress',
-        message: newTravelRequestBlockedMessage(active!),
-        backgroundColor: AppColors.warning,
-      );
-      return;
-    }
     AppNavigation.to(AppRoutes.userCreateRequest);
   }
 

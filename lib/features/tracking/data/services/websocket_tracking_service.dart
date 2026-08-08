@@ -620,6 +620,8 @@ class WebSocketTrackingService {
     String? requestId,
     String? legId,
     String? sessionId,
+    String? source,
+    String? userId,
   }) async {
     final socket = _socket;
     if (socket == null || !socket.connected) {
@@ -641,12 +643,17 @@ class WebSocketTrackingService {
       if (requestId != null && requestId.isNotEmpty) 'requestId': requestId,
       if (legId != null && legId.isNotEmpty) 'legId': legId,
       if (sessionId != null && sessionId.isNotEmpty) 'sessionId': sessionId,
+      if (source != null && source.isNotEmpty) 'source': source,
+      if (userId != null && userId.isNotEmpty) 'userId': userId,
     };
 
     socket.emitWithAck('tracking.location.update', payload, ack: (data) {
       if (data is Map) {
-        final ok = data['ok'] == true || data['persisted'] == true;
-        completer.complete(ok);
+        // Only treat as synced when Nest actually wrote the GPS row.
+        // ok:true + persisted:false used to mark teleports "synced" and they
+        // never reached REST catch-up — completed maps showed blank gaps.
+        final persisted = data['persisted'] == true;
+        completer.complete(persisted);
       } else {
         completer.complete(false);
       }

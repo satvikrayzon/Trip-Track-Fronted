@@ -44,4 +44,34 @@ void main() {
     );
     expect(decision.accepted, isTrue);
   });
+
+  test('accepts city-scale hop after long tracking silence', () {
+    final decision = GpsJumpGate.evaluate(
+      lat: 21.20,
+      lng: 72.86,
+      accuracyM: 20,
+      timestamp: DateTime.now(),
+      prevLat: 21.17,
+      prevLng: 72.83,
+      prevTimestamp: DateTime.now().subtract(const Duration(minutes: 5)),
+    );
+    expect(decision.accepted, isTrue);
+    expect(decision.reason, 'gap_resume');
+  });
+
+  test('accepts short kill gap under 2.5km so road fill can run', () {
+    // ~1.1km hop after 3 minutes — previously accepted without gap_resume,
+    // so Directions B→C never ran.
+    final decision = GpsJumpGate.evaluate(
+      lat: 21.178,
+      lng: 72.838,
+      accuracyM: 18,
+      timestamp: DateTime.now(),
+      prevLat: 21.17,
+      prevLng: 72.83,
+      prevTimestamp: DateTime.now().subtract(const Duration(minutes: 3)),
+    );
+    expect(decision.accepted, isTrue);
+    expect(decision.reason, 'gap_resume');
+  });
 }

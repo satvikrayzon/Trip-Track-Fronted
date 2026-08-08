@@ -144,17 +144,6 @@ class CreateRequestController {
       isLoading.value = true;
       errorMessage.value = '';
 
-      final blocking = await findBlockingActiveTrip();
-      if (blocking != null) {
-        errorMessage.value = newTravelRequestBlockedMessage(blocking);
-        showAppSnackBar(
-          title: 'Trip In Progress',
-          message: newTravelRequestBlockedMessage(blocking),
-          backgroundColor: const Color(0xFFF59E0B),
-        );
-        return;
-      }
-
       final fuelError = validateFuelType();
       if (fuelError != null) {
         errorMessage.value = fuelError;
@@ -192,7 +181,8 @@ class CreateRequestController {
                 endAddress: to.name,
               );
           await _localDb.saveTravelRequest(merged.toMap());
-          await _activeTripRestore.pinActiveTrip(merged);
+          // Do not steal GPS focus from an already-running trip.
+          // Pin happens on departure punch instead.
 
           showAppSnackBar(
             title: 'Success',
@@ -313,7 +303,9 @@ class CreateRequestController {
                     : original.fuelType,
               );
           await _localDb.saveTravelRequest(merged.toMap());
-          await _activeTripRestore.pinActiveTrip(merged);
+          if (isTravelRequestRunning(merged)) {
+            await _activeTripRestore.pinActiveTrip(merged);
+          }
 
           showAppSnackBar(
             title: 'Updated',

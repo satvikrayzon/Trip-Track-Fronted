@@ -138,15 +138,32 @@ class _UserHomeScreenState extends State<UserHomeScreen> {
                           flex: 3,
                           child: Column(
                             children: [
-                              // Active trip banner section
+                              // In-progress trip banners (supports multiple)
                               AnimatedBuilder(
-                                animation: _controller.activeTrip,
+                                animation: Listenable.merge([
+                                  _controller.activeTrip,
+                                  _controller.recentRequests,
+                                ]),
                                 builder: (context, _) {
-                                  final trip = _controller.activeTrip.value;
-                                  if (trip == null) return const SizedBox.shrink();
+                                  final trips = _runningTrips();
+                                  if (trips.isEmpty) {
+                                    return const SizedBox.shrink();
+                                  }
                                   return Padding(
                                     padding: const EdgeInsets.only(bottom: 24.0),
-                                    child: _buildActiveTripBanner(context, trip),
+                                    child: Column(
+                                      children: [
+                                        for (var i = 0; i < trips.length; i++) ...[
+                                          if (i > 0) const SizedBox(height: 12),
+                                          _buildActiveTripBanner(
+                                            context,
+                                            trips[i],
+                                            index: i,
+                                            total: trips.length,
+                                          ),
+                                        ],
+                                      ],
+                                    ),
                                   );
                                 },
                               ),
@@ -169,15 +186,26 @@ class _UserHomeScreenState extends State<UserHomeScreen> {
                     ),
                   )
                 else ...[
-                  // Active trip banner section for mobile
+                  // In-progress trip banners for mobile (supports multiple)
                   AnimatedBuilder(
-                    animation: _controller.activeTrip,
+                    animation: Listenable.merge([
+                      _controller.activeTrip,
+                      _controller.recentRequests,
+                    ]),
                     builder: (context, _) {
-                      final trip = _controller.activeTrip.value;
-                      if (trip == null) return const SizedBox.shrink();
+                      final trips = _runningTrips();
+                      if (trips.isEmpty) return const SizedBox.shrink();
                       return Column(
                         children: [
-                          _buildActiveTripBanner(context, trip),
+                          for (var i = 0; i < trips.length; i++) ...[
+                            if (i > 0) SizedBox(height: 12.scp(context)),
+                            _buildActiveTripBanner(
+                              context,
+                              trips[i],
+                              index: i,
+                              total: trips.length,
+                            ),
+                          ],
                           SizedBox(height: 24.scp(context)),
                         ],
                       );
@@ -209,11 +237,31 @@ class _UserHomeScreenState extends State<UserHomeScreen> {
     );
   }
 
+  /// All in-progress trips (recent list + pinned active), deduped.
+  List<TravelRequestModel> _runningTrips() {
+    final byId = <String, TravelRequestModel>{};
+    void add(TravelRequestModel? t) {
+      if (t == null || !isTravelRequestRunning(t)) return;
+      final id = t.requestId.isNotEmpty ? t.requestId : t.restResourceId;
+      if (id.isEmpty) return;
+      byId.putIfAbsent(id, () => t);
+    }
+
+    add(_controller.activeTrip.value);
+    for (final t in _controller.recentRequests.value) {
+      add(t);
+    }
+    return byId.values.toList();
+  }
+
   Widget _buildActiveTripBanner(
     BuildContext context,
-    TravelRequestModel trip,
-  ) {
+    TravelRequestModel trip, {
+    int index = 0,
+    int total = 1,
+  }) {
     final isDesktop = !AdaptiveLayout.isCompact(context);
+    final title = total > 1 ? 'Continue Trip ${index + 1} of $total' : 'Continue Trip';
 
     final bannerContent = GestureDetector(
       onTap: () => unawaited(
@@ -255,7 +303,7 @@ class _UserHomeScreenState extends State<UserHomeScreen> {
                 ),
                 SizedBox(width: 8.scp(context)),
                 Text(
-                  'Continue Trip',
+                  title,
                   style: FontUtilities.style(
                     fontSize: 14.scp(context),
                     fontColor: Colors.white,
@@ -849,16 +897,6 @@ class _UserHomeScreenState extends State<UserHomeScreen> {
   }
 
   void _handleCreateRequest() {
-    final active = _controller.activeTrip.value;
-    if (blocksNewTravelRequest(active)) {
-      showAppSnackBar(
-        title: 'Trip In Progress',
-        message: newTravelRequestBlockedMessage(active!),
-        backgroundColor: Colors.orange,
-      );
-      return;
-    }
-
     AppNavigation.to(AppRoutes.userCreateRequest);
   }
 

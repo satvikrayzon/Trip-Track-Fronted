@@ -459,7 +459,7 @@ class TravelRequestRemoteDataSource {
     });
   }
 
-  Future<ApiResult<int>> postRoutePointsBatch(
+  Future<ApiResult<Map<String, dynamic>>> postRoutePointsBatch(
     String requestId,
     List<Map<String, dynamic>> points,
   ) {
@@ -483,11 +483,21 @@ class TravelRequestRemoteDataSource {
             },
           )
           .toList();
-      final response = await _dio.post<void>(
+      final response = await _dio.post(
         ApiEndpoints.travelRequestRoutePointsBatch(requestId),
         data: {'points': payload},
       );
-      return response.statusCode ?? 201;
+      final data = response.data;
+      if (data is Map) {
+        return Map<String, dynamic>.from(data);
+      }
+      return <String, dynamic>{
+        'inserted': points.length,
+        'acceptedClientPointIds': points
+            .map((p) => p['pointId']?.toString() ?? p['clientPointId']?.toString())
+            .whereType<String>()
+            .toList(),
+      };
     });
   }
 
@@ -647,6 +657,86 @@ class TravelRequestRemoteDataSource {
       final data = response.data;
       if (data == null) return <String, dynamic>{};
       return Map<String, dynamic>.from(data as Map);
+    });
+  }
+
+  /// Nest Directions proxy — `POST /directions/route`.
+  ///
+  /// Returns route maps with `points` (list of `{lat,lng}`), `distanceKm`, etc.
+  Future<ApiResult<List<Map<String, dynamic>>>> fetchDrivingRoute({
+    required double originLatitude,
+    required double originLongitude,
+    required double destinationLatitude,
+    required double destinationLongitude,
+    bool alternatives = true,
+  }) {
+    return runApi(() async {
+      final response = await _dio.post(
+        ApiEndpoints.directionsRoute,
+        data: {
+          'origin': {
+            'lat': originLatitude,
+            'lng': originLongitude,
+          },
+          'destination': {
+            'lat': destinationLatitude,
+            'lng': destinationLongitude,
+          },
+          'alternatives': alternatives,
+        },
+        options: dioTimeoutOptions(const Duration(seconds: 15)),
+      );
+      final data = response.data;
+      if (data is! Map) return <Map<String, dynamic>>[];
+      final root = Map<String, dynamic>.from(data);
+      final routes = root['routes'];
+      if (routes is! List) return <Map<String, dynamic>>[];
+      return routes
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    });
+  }
+
+  /// Nest Roads Snap-to-Roads proxy — `POST /directions/snap-path`.
+  Future<ApiResult<List<Map<String, dynamic>>>> snapPathToRoads({
+    required List<Map<String, double>> points,
+    bool interpolate = true,
+  }) {
+    return runApi(() async {
+      final response = await _dio.post(
+        ApiEndpoints.directionsSnapPath,
+        data: {
+          'points': points,
+          'interpolate': interpolate,
+        },
+        options: dioTimeoutOptions(const Duration(seconds: 20)),
+      );
+      final data = response.data;
+      if (data is! Map) return <Map<String, dynamic>>[];
+      final root = Map<String, dynamic>.from(data);
+      final list = root['points'];
+      if (list is! List) return <Map<String, dynamic>>[];
+      return list
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    });
+  }
+
+  /// Nest GPS↔road merge — `POST /directions/align-path`.
+  Future<ApiResult<Map<String, dynamic>>> alignPathToRoads({
+    required List<Map<String, dynamic>> points,
+  }) {
+    return runApi(() async {
+      final response = await _dio.post(
+        ApiEndpoints.directionsAlignPath,
+        data: {'points': points},
+        options: dioTimeoutOptions(const Duration(seconds: 45)),
+      );
+      final data = response.data;
+      if (data is! Map) return <String, dynamic>{};
+      return Map<String, dynamic>.from(data);
     });
   }
 }

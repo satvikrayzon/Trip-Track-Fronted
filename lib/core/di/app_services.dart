@@ -11,6 +11,7 @@ import '../services/punch_location_service.dart';
 import '../services/punch_reminder_service.dart';
 import '../services/map_matching_service.dart';
 import '../services/sync_service.dart';
+import '../services/trip_road_metrics_service.dart';
 import '../services/tracking_coverage_service.dart';
 import '../services/tracking_event_service.dart';
 import '../services/tracking_lifecycle_binder.dart';
@@ -67,6 +68,8 @@ void registerAppServices() {
   sl.lazy<MapMatchingService>(() => MapMatchingService(
         travelApi: sl.get<TravelRequestRemoteDataSource>(),
       ));
+
+  sl.lazy<TripRoadMetricsService>(TripRoadMetricsService.new);
 
   sl.lazy<SyncService>(() {
     final s = SyncService(

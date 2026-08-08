@@ -1034,8 +1034,10 @@ class TravelRequestModel extends TravelRequestEntity {
                   remoteLeg.meetingEndPunch ?? localLeg.meetingEndPunch,
               routePolylineEncoded: remoteLeg.routePolylineEncoded ??
                   localLeg.routePolylineEncoded,
-              actualDistanceKmFromTrack: remoteLeg.actualDistanceKmFromTrack ??
-                  localLeg.actualDistanceKmFromTrack,
+              actualDistanceKmFromTrack: _preferGpsKm(
+                remoteLeg.actualDistanceKmFromTrack,
+                localLeg.actualDistanceKmFromTrack,
+              ),
               trackMovingDurationMinutes:
                   remoteLeg.trackMovingDurationMinutes ??
                       localLeg.trackMovingDurationMinutes,
@@ -1046,8 +1048,10 @@ class TravelRequestModel extends TravelRequestEntity {
                 remote: remoteLeg,
                 local: localLeg,
               ),
-              provisionalDistanceKm: remoteLeg.provisionalDistanceKm ??
-                  localLeg.provisionalDistanceKm,
+              provisionalDistanceKm: _preferGpsKm(
+                remoteLeg.provisionalDistanceKm,
+                localLeg.provisionalDistanceKm,
+              ),
               matchedRoutePolylineEncoded: _preferSaneMatchedPolyline(
                 remote: remoteLeg,
                 local: localLeg,
@@ -1441,6 +1445,15 @@ class TravelRequestModel extends TravelRequestEntity {
     final longitude = _parseDouble(map['destinationLng']);
     if (latitude == null || longitude == null) return null;
     return {'latitude': latitude, 'longitude': longitude};
+  }
+
+  /// Prefer the more complete GPS track; avoid inflated remote overwriting local.
+  static double? _preferGpsKm(double? remote, double? local) {
+    if (remote == null || remote <= 0) return local;
+    if (local == null || local <= 0) return remote;
+    if (remote > local * 1.35 && remote - local > 0.5) return local;
+    if (local > remote * 1.15 && local - remote > 0.3) return local;
+    return remote;
   }
 
   static double? _preferSaneOfficialKm({

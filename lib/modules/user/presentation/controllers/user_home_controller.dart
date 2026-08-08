@@ -13,6 +13,7 @@ import '../../../../core/services/active_trip_restore_service.dart';
 import '../../../../core/services/background_location_service.dart';
 import '../../../../core/services/punch_reminder_service.dart';
 import '../../../../core/services/tracking_session_service.dart';
+import '../../../../core/services/trip_road_metrics_service.dart';
 
 import '../../../../core/utils/travel_request_debug_log.dart';
 import '../../../../core/utils/app_debug_log.dart';
@@ -217,12 +218,24 @@ class UserHomeController {
 
         requests.sort((a, b) => b.requestDate.compareTo(a.requestDate));
 
+        // Recompute GPS km + allowance so cards match detail route (not stale API).
+        List<TravelRequestModel> enhanced = requests;
+        if (ServiceLocator.I.has<TripRoadMetricsService>()) {
+          enhanced = await ServiceLocator.I
+              .get<TripRoadMetricsService>()
+              .enhanceAll(requests.take(10).toList());
+          // Keep rest of page unenhanced if list was longer than 10.
+          if (requests.length > enhanced.length) {
+            enhanced = [...enhanced, ...requests.skip(enhanced.length)];
+          }
+        }
+
         if (summaryResult is! ApiSuccess) {
           final pending = data.pending ??
-              requests.where((r) => r.status != 'Completed').length;
+              enhanced.where((r) => r.status != 'Completed').length;
 
           final completed = data.completed ??
-              requests.where((r) => r.status == 'Completed').length;
+              enhanced.where((r) => r.status == 'Completed').length;
 
           totalRequests.value = data.total;
 
@@ -235,14 +248,14 @@ class UserHomeController {
           for (final r in recentRequests.value)
             if (r.requestId.isNotEmpty) r.requestId: r,
         };
-        recentRequests.value = requests.take(5).map((item) {
+        recentRequests.value = enhanced.take(5).map((item) {
           final prev = previousById[item.requestId];
           if (prev == null) return item;
           return item.mergePreservingLocalProgress(prev);
         }).toList();
 
-        if (requests.isNotEmpty) {
-          await _syncHiveWithServer(userId, requests);
+        if (enhanced.isNotEmpty) {
+          await _syncHiveWithServer(userId, enhanced);
         }
 
         unawaited(_refreshActiveTripInBackground());

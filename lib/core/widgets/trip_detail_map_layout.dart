@@ -18,9 +18,11 @@ import 'map_web_pointer_shield.dart';
 import 'trip_route_fullscreen_map_screen.dart';
 import 'trip_route_map_data.dart';
 import '../services/background_location_service.dart';
+import '../services/gps_gap_road_fill.dart';
 import '../di/service_locator.dart';
 import '../utils/distance_sanity.dart';
 import '../utils/geo_utils.dart';
+import '../utils/route_point_simplify.dart';
 import '../../modules/travel/data/models/route_segment_model.dart';
 
 /// Zomato / Swiggy / Uber style trip detail: full-screen map + draggable sheet.
@@ -59,10 +61,14 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   late DraggableScrollableController _sheetController;
   LatLng? _lastCameraTarget;
   String? _lastCameraPathSig;
+  bool _userMovedCamera = false;
+  bool _cameraFollowLive = true;
+  Timer? _liveReloadDebounce;
+  int _routeLoadGeneration = 0;
 
-  Future<List<List<LatLng>>>? _routePointsFuture;
   String _routePointsCacheKey = '';
-  List<List<LatLng>>? _resolvedPoints;
+  List<List<List<LatLng>>>? _resolvedPoints;
+  double? _trackedPathKm;
   List<RouteSegmentModel> _matchedSegments = const [];
   String _matchedCacheKey = '';
   BackgroundLocationService? _bgLocationService;
@@ -72,6 +78,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   static const double _sheetMin = 0.22;
   static const double _sheetInitial = 0.38;
   static const double _sheetMax = 0.92;
+
   /// Start easing the action button toward the screen bottom.
   static const double _actionPinStart = 0.68;
 
@@ -86,6 +93,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
 
   bool get _shieldWebMapOverlays => kIsWeb && _useGoogleMaps;
 
+  /// Prefer gap-filled paths. adminServerPath only signals live mode.
   bool get _isLiveServer =>
       widget.adminServerPath != null && widget.adminServerPath!.isNotEmpty;
 
@@ -95,6 +103,11 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         s == 'Returning' ||
         s == 'At Client' ||
         s == 'In Meeting';
+  }
+
+  bool get _isCompletedTrip {
+    final s = widget.request.status.trim().toLowerCase();
+    return s == 'completed' || widget.request.tripEndedAt != null;
   }
 
   double get _sheetSize =>
@@ -119,38 +132,49 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
 
   bool get _hasActionButton => widget.sheetFooter != null;
 
+  /// Structural only — punches / status / match. Live tip must NOT be here or
+  /// every GPS tick wipes the trail and shows a loader.
   String _routeDataKey(TravelRequestModel r) {
-    final last = r.routePoints.isNotEmpty ? r.routePoints.last : null;
-    final lastSig = last == null
-        ? '0'
-        : '${last['latitude']}|${last['longitude']}|${r.routePoints.length}';
-    return '${r.requestId}|${r.routePointCount}|${r.routePoints.length}|$lastSig|${r.status}|'
+    return '${r.requestId}|${r.status}|'
         '${r.tripLegs.map((e) => '${e.legId}:${e.departurePunch?.time}:${e.arrivalPunch?.time}:${e.officialDistanceKm}:${e.matchedRoutePolylineEncoded?.length ?? 0}').join(';')}';
   }
 
-  String _adminServerKey(List<LatLng>? p) {
-    if (p == null) return 'n';
-    if (p.isEmpty) return '0';
-    final last = p.last;
-    return '${p.length}|${last.latitude}|${last.longitude}';
-  }
-
   String _fullCacheKey() {
-    final bgCount = (_bgLocationService?.activeRequestId == widget.request.requestId)
-        ? _bgLocationService?.pointsBuffered.value ?? 0
-        : 0;
-    return '${_routeDataKey(widget.request)}|srv:${_adminServerKey(widget.adminServerPath)}|bg:$bgCount';
+    return _routeDataKey(widget.request);
   }
 
-  List<List<LatLng>>? get _activePoints {
-    final server = widget.adminServerPath;
-    if (server != null && server.isNotEmpty) return [server];
+  /// Tip signature for lightweight live append (not full Snap reload).
+  String _liveTipKey() {
+    final bgCount =
+        (_bgLocationService?.activeRequestId == widget.request.requestId)
+            ? _bgLocationService?.pointsBuffered.value ?? 0
+            : 0;
+    final admin = widget.adminServerPath;
+    final adminTip = (admin != null && admin.isNotEmpty)
+        ? '${admin.length}|${admin.last.latitude}|${admin.last.longitude}'
+        : '0';
+    final pts = widget.request.routePoints;
+    final last = pts.isNotEmpty ? pts.last : null;
+    final lastSig = last == null
+        ? '0'
+        : '${last['latitude']}|${last['longitude']}|${pts.length}';
+    return 'bg:$bgCount|srv:$adminTip|rp:$lastSig';
+  }
+
+  String _lastLiveTipKey = '';
+
+  List<List<List<LatLng>>>? get _activePoints {
+    // Always prefer gap-filled resolved paths. Admin live LatLng lists used to
+    // bypass fill and painted false straight chords after app-kill.
     return _resolvedPoints;
   }
 
-  List<LatLng> _flattenPaths(List<List<LatLng>>? paths) {
+  List<LatLng> _flattenPaths(List<List<List<LatLng>>>? paths) {
     if (paths == null) return [];
-    return paths.expand((p) => p).toList();
+    return [
+      for (final leg in paths)
+        for (final seg in leg) ...seg,
+    ];
   }
 
   @override
@@ -170,11 +194,105 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     _syncMatchedLoad();
   }
 
+  Timer? _localPointsDebounce;
+
   void _onLocalPointsUpdated() {
-    if (_bgLocationService?.activeRequestId == widget.request.requestId) {
-      evictRoutePointsCache(widget.request.requestId);
-      _syncRouteLoad();
+    if (_bgLocationService?.activeRequestId != widget.request.requestId) {
+      return;
     }
+    _scheduleLiveTipUpdate();
+  }
+
+  void _scheduleLiveTipUpdate() {
+    _applyLiveTipAppend();
+    // Heavy Snap/Directions reconcile — keep trail visible meanwhile.
+    _liveReloadDebounce?.cancel();
+    _liveReloadDebounce = Timer(const Duration(seconds: 8), () {
+      if (!mounted) return;
+      evictRoutePointsCache(widget.request.requestId);
+      _routePointsCacheKey = '';
+      _syncRouteLoad(keepPrevious: true);
+    });
+  }
+
+  LatLng? _latestLiveTip() {
+    final admin = widget.adminServerPath;
+    if (admin != null && admin.isNotEmpty) return admin.last;
+    final pts = widget.request.routePoints;
+    if (pts.isEmpty) return null;
+    final last = pts.last;
+    final lat = (last['latitude'] as num?)?.toDouble() ??
+        (last['lat'] as num?)?.toDouble();
+    final lng = (last['longitude'] as num?)?.toDouble() ??
+        (last['lng'] as num?)?.toDouble();
+    if (lat == null || lng == null) return null;
+    return LatLng(lat, lng);
+  }
+
+  void _applyLiveTipAppend() {
+    final tip = _latestLiveTip();
+    if (tip == null || _resolvedPoints == null) return;
+    final tipKey = _liveTipKey();
+    if (tipKey == _lastLiveTipKey) return;
+    _lastLiveTipKey = tipKey;
+
+    final paths = _resolvedPoints!;
+    if (paths.isEmpty) return;
+    final legIndex =
+        widget.request.currentLegIndex.clamp(0, paths.length - 1);
+    final leg = paths[legIndex];
+    if (leg.isEmpty || leg.last.isEmpty) {
+      // Start a segment on the active leg.
+      final next = [
+        for (var i = 0; i < paths.length; i++)
+          if (i == legIndex)
+            [
+              [tip],
+            ]
+          else
+            paths[i],
+      ];
+      setState(() => _resolvedPoints = next);
+      _followLiveCamera(tip);
+      return;
+    }
+    final lastSeg = leg.last;
+    final prev = lastSeg.last;
+    final jump = GeoUtils.distanceMeters(
+      prev.latitude,
+      prev.longitude,
+      tip.latitude,
+      tip.longitude,
+    );
+    if (jump < 4) return;
+    if (jump > GpsGapRoadFill.breakChordMeters) {
+      // Kill/reopen hop — full reload, keep old trail until ready.
+      evictRoutePointsCache(widget.request.requestId);
+      _routePointsCacheKey = '';
+      _syncRouteLoad(keepPrevious: true);
+      return;
+    }
+
+    final newSeg = [...lastSeg, tip];
+    final newLeg = [
+      ...leg.sublist(0, leg.length - 1),
+      newSeg,
+    ];
+    setState(() {
+      _resolvedPoints = [
+        for (var i = 0; i < paths.length; i++)
+          if (i == legIndex) newLeg else paths[i],
+      ];
+    });
+    _followLiveCamera(tip);
+  }
+
+  void _followLiveCamera(LatLng tip) {
+    if (!_cameraFollowLive || _userMovedCamera) return;
+    if (!_isLiveTrip && !_isLiveServer) return;
+    final c = _mapController;
+    if (c == null) return;
+    unawaited(c.animateCamera(CameraUpdate.newLatLng(tip)));
   }
 
   void _initSheetController() {
@@ -210,15 +328,27 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   @override
   void didUpdateWidget(TripDetailMapLayout oldWidget) {
     super.didUpdateWidget(oldWidget);
-    _syncRouteLoad();
-    _syncMatchedLoad();
-    if (oldWidget.request.requestId != widget.request.requestId) {
+    final tripChanged =
+        oldWidget.request.requestId != widget.request.requestId;
+    if (tripChanged) {
       _releaseMapController();
       _lastCameraTarget = null;
       _lastCameraPathSig = null;
+      _userMovedCamera = false;
+      _cameraFollowLive = true;
+      _lastLiveTipKey = '';
       _recreateSheetController();
+      _routePointsCacheKey = '';
+      _resolvedPoints = null;
     }
-    _moveCameraToStartIfNeeded();
+    _syncRouteLoad(keepPrevious: !tripChanged);
+    _syncMatchedLoad();
+    // Live tip: append smoothly; do not fit whole route every tick.
+    if (!tripChanged && (_isLiveTrip || _isLiveServer)) {
+      _scheduleLiveTipUpdate();
+    } else if (tripChanged) {
+      _moveCameraToStartIfNeeded();
+    }
     if ((_isLiveTrip || _isLiveServer) && !_livePulse.isAnimating) {
       _livePulse.repeat(reverse: true);
     } else if (!_isLiveTrip && !_isLiveServer && _livePulse.isAnimating) {
@@ -226,24 +356,101 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     }
   }
 
-  void _syncRouteLoad() {
+  void _syncRouteLoad({bool keepPrevious = true}) {
     final key = _fullCacheKey();
-    if (key == _routePointsCacheKey) return;
+    if (key == _routePointsCacheKey && _resolvedPoints != null) return;
     _routePointsCacheKey = key;
 
-    final server = widget.adminServerPath;
-    if (server != null && server.isNotEmpty) {
-      _resolvedPoints = [List<LatLng>.from(server)];
-      _routePointsFuture = null;
-      return;
+    // Keep last good trail visible — never flash loader on live GPS ticks.
+    if (!keepPrevious || _resolvedPoints == null) {
+      _resolvedPoints = null;
+      _trackedPathKm = null;
     }
-
-    _resolvedPoints = null;
-    _routePointsFuture = loadTraveledLegPoints(widget.request).then((pts) {
-      if (!mounted) return pts;
-      setState(() => _resolvedPoints = pts);
+    final isCompleted = _isCompletedTrip;
+    final gen = ++_routeLoadGeneration;
+    final loadFuture = () async {
+      // ignore: avoid_print
+      print(
+        '[ROAD_ALIGN] map _syncRouteLoad '
+        'id=${widget.request.requestId} status=${widget.request.status} '
+        'completed=$isCompleted keepPrevious=$keepPrevious build=v5-leg-colors',
+      );
+      // Prefer per-leg paths so Whole route paints distinct colors per leg.
+      final legs = await loadTraveledLegPoints(widget.request);
+      final hasLegPaint = legs.any((leg) => leg.any((s) => s.length >= 2));
+      if (hasLegPaint) {
+        // ignore: avoid_print
+        print(
+          '[ROAD_ALIGN] map using per-leg paths legs=${legs.length}',
+        );
+        return legs;
+      }
+      final whole = await loadWholeTripPathFilled(widget.request);
+      if (whole.isNotEmpty) {
+        // ignore: avoid_print
+        print(
+          '[ROAD_ALIGN] map using whole path segs=${whole.length}',
+        );
+        return [whole];
+      }
+      // ignore: avoid_print
+      print('[ROAD_ALIGN] map empty path');
+      return <List<List<LatLng>>>[];
+    }()
+        .then((pts) {
+      if (!mounted || gen != _routeLoadGeneration) return pts;
+      final flat = <LatLng>[
+        for (final leg in pts)
+          for (final seg in leg)
+            if (seg.length >= 2) ...seg,
+      ];
+      final trackedKm = pathSegmentsLengthKm([
+        for (final leg in pts)
+          for (final seg in leg)
+            if (seg.length >= 2) seg,
+      ]);
+      // ignore: avoid_print
+      print(
+        '[ROAD_ALIGN] map SETSTATE flatPts=${flat.length} '
+        'trackedKm=${trackedKm.toStringAsFixed(2)}',
+      );
+      setState(() {
+        _resolvedPoints = pts;
+        _trackedPathKm = trackedKm > 0.05 ? trackedKm : null;
+      });
+      // Fit bounds only on first paint / trip change — not every live tick.
+      if (!keepPrevious || _lastCameraPathSig == null) {
+        _lastCameraPathSig = null;
+        _moveCameraToStartIfNeeded();
+      } else if (_isLiveTrip || _isLiveServer) {
+        final tip = flat.isNotEmpty ? flat.last : null;
+        if (tip != null) _followLiveCamera(tip);
+      }
       return pts;
     });
+    unawaited(loadFuture);
+  }
+
+  /// Prefer cleaned GPS trail km when Nest "official" was inflated by extras.
+  (double? km, String label) _sheetDistance(TravelRequestModel request) {
+    final official = request.effectiveDistanceKm > 0
+        ? request.effectiveDistanceKm
+        : (request.distance ?? 0);
+    final tracked = _trackedPathKm;
+    if (tracked != null && tracked > 0.05) {
+      if (official <= 0) return (tracked, 'Tracked');
+      // Official much higher than painted path → show tracked (extras inflated km).
+      if (official > tracked * 1.15 && official - tracked > 0.3) {
+        return (tracked, 'Tracked');
+      }
+    }
+    if (official > 0) {
+      return (official, request.displayDistanceLabel);
+    }
+    return (
+      tracked,
+      tracked != null ? 'Tracked' : request.displayDistanceLabel
+    );
   }
 
   void _syncMatchedLoad() {
@@ -269,6 +476,8 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   @override
   void dispose() {
     _bgLocationService?.pointsBuffered.removeListener(_onLocalPointsUpdated);
+    _localPointsDebounce?.cancel();
+    _liveReloadDebounce?.cancel();
     _mapPaddingDebounce?.cancel();
     _sheetController.removeListener(_onSheetSizeChanged);
     _livePulse.dispose();
@@ -286,15 +495,21 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   void _moveCameraToStartIfNeeded() {
     final controller = _mapController;
     if (controller == null) return;
+    if (_userMovedCamera && (_isLiveTrip || _isLiveServer)) return;
 
     final pts = _activePoints;
-    if (pts != null && pts.any((p) => p.isNotEmpty)) {
-      final flattened = <LatLng>[];
-      for (final p in pts) {
-        flattened.addAll(p);
-      }
+    if (pts != null && pts.any((leg) => leg.any((s) => s.isNotEmpty))) {
+      final flattened = _flattenPaths(pts);
       if (flattened.isNotEmpty) {
-        final pathSig = '${flattened.length}_${flattened.first.latitude}_${flattened.last.latitude}';
+        // Live: follow tip, don't re-fit whole bounds every update.
+        if (_isLiveTrip || _isLiveServer) {
+          _followLiveCamera(flattened.last);
+          _lastCameraPathSig =
+              '${flattened.length}_${flattened.last.latitude}';
+          return;
+        }
+        final pathSig =
+            '${flattened.length}_${flattened.first.latitude}_${flattened.last.latitude}';
         if (_lastCameraPathSig == pathSig) return;
         _lastCameraPathSig = pathSig;
         unawaited(_fitCamera(flattened));
@@ -333,7 +548,8 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
 
     final dest = tripMapDestinationTarget(widget.request);
     if (dest != null &&
-        (dest.latitude != start.latitude || dest.longitude != start.longitude)) {
+        (dest.latitude != start.latitude ||
+            dest.longitude != start.longitude)) {
       markers.add(
         Marker(
           markerId: const MarkerId('planned_dest'),
@@ -403,14 +619,16 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     );
   }
 
-  Set<Polyline> _buildPolylines(List<List<LatLng>>? paths) {
+  Set<Polyline> _buildPolylines(List<List<List<LatLng>>>? paths) {
     final set = <Polyline>{};
     final hasMatched = _matchedSegments.isNotEmpty ||
         widget.request.tripLegs
             .any((l) => (l.matchedRoutePolylineEncoded ?? '').isNotEmpty);
 
     // Planned corridor only for short local trips — never draw Oman→India lines.
-    if (!hasMatched && (paths == null || paths.every((p) => p.length < 2))) {
+    if (!hasMatched &&
+        (paths == null ||
+            paths.every((leg) => leg.every((s) => s.length < 2)))) {
       final start = tripMapStartTarget(widget.request);
       final dest = tripMapDestinationTarget(widget.request);
       if (start != null &&
@@ -437,37 +655,43 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       }
     }
 
-    // Layer A — live / provisional GPS trail (high contrast).
-    if (paths != null) {
+    // One trail only — never GPS zigzags + Nest matched purple on top.
+    // After mark arrival, matched polylines used to paint a second fake route.
+    final isCompleted = _isCompletedTrip;
+    final gpsHasPath = paths != null &&
+        paths.any((leg) => leg.any((s) => s.length >= 2));
+    final showGpsLayer = gpsHasPath || _isLiveTrip || isCompleted;
+    final showMatchedLayer = hasMatched && !gpsHasPath && !isCompleted;
+    const edgeMax = kAlignedMapMaxEdgeMeters;
+    if (showGpsLayer && paths != null) {
       for (var i = 0; i < paths.length; i++) {
-        final display = mapDisplayRoutePoints(paths[i]);
-        if (display.length < 2) continue;
-        set.add(
-          Polyline(
-            polylineId: PolylineId('trip_route_shadow_$i'),
-            points: display,
-            color: AppColors.primaryDark.withValues(alpha: 0.45),
-            width: 11,
-            jointType: JointType.round,
-            startCap: Cap.roundCap,
-            endCap: Cap.roundCap,
-          ),
-        );
-        set.add(
-          Polyline(
-            polylineId: PolylineId('trip_route_live_$i'),
-            points: display,
-            color: AppColors.primary.withValues(alpha: 0.95),
-            width: hasMatched ? 5 : 7,
-            jointType: JointType.round,
-            startCap: Cap.roundCap,
-            endCap: Cap.roundCap,
-          ),
-        );
+        final color = _legTrailColor(i);
+        for (var s = 0; s < paths[i].length; s++) {
+          final pieces = mapDisplayRouteSegments(
+            paths[i][s],
+            maxEdgeMeters: edgeMax,
+          );
+          for (var p = 0; p < pieces.length; p++) {
+            final display = pieces[p];
+            if (display.length < 2) continue;
+            set.add(
+              Polyline(
+                polylineId: PolylineId('trip_route_${i}_${s}_$p'),
+                points: display,
+                color: color,
+                width: 6,
+                jointType: JointType.round,
+                startCap: Cap.roundCap,
+                endCap: Cap.roundCap,
+              ),
+            );
+          }
+        }
       }
     }
 
-    // Layer B — official matched segments (skip absurd teleport matches).
+    // Layer B — official matched segments (live / in-progress only).
+    if (!showMatchedLayer) return set;
     final segments = (_matchedSegments.isNotEmpty
             ? _matchedSegments
             : widget.request.tripLegs
@@ -496,8 +720,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       if (leg?.hasAbsurdOfficialDistance == true) return false;
       final km = seg.lengthM / 1000.0;
       if (km <= 0) return true;
-      final gps = leg?.provisionalDistanceKm ??
-          leg?.actualDistanceKmFromTrack;
+      final gps = leg?.provisionalDistanceKm ?? leg?.actualDistanceKmFromTrack;
       final gpsOrTrip = gps ??
           (widget.request.effectiveDistanceKm > 0
               ? widget.request.effectiveDistanceKm
@@ -513,7 +736,8 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
 
     for (var i = 0; i < segments.length; i++) {
       final seg = segments[i];
-      final pts = mapDisplayRoutePoints(decodePipePolyline(seg.polylineEncoded));
+      final pts =
+          mapDisplayRoutePoints(decodePipePolyline(seg.polylineEncoded));
       if (pts.length < 2) continue;
       final style = _segmentStyle(seg.kind);
       set.add(
@@ -534,30 +758,33 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     return set;
   }
 
+  Color _legTrailColor(int legIndex) => AppColors.legTrailColor(legIndex);
+
   ({Color color, int width, bool dashed}) _segmentStyle(RouteSegmentKind kind) {
+    // One consistent road color — orange "estimated" chords looked like bugs.
     switch (kind) {
       case RouteSegmentKind.gpsVerified:
         return (
-          color: AppColors.primaryDark,
+          color: AppColors.primary,
           width: 7,
           dashed: false,
         );
       case RouteSegmentKind.mapMatched:
         return (
           color: AppColors.primary,
-          width: 6,
+          width: 7,
           dashed: false,
         );
       case RouteSegmentKind.estimated:
         return (
-          color: AppColors.warning,
-          width: 5,
-          dashed: true,
+          color: AppColors.primary,
+          width: 6,
+          dashed: false,
         );
     }
   }
 
-  Set<Marker> _buildMarkers(List<List<LatLng>> paths) {
+  Set<Marker> _buildMarkers(List<List<List<LatLng>>> paths) {
     final display = _flattenPaths(paths);
     final sanitized = mapDisplayRoutePoints(display);
     if (sanitized.isEmpty) return {};
@@ -595,16 +822,14 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     return markers;
   }
 
-  Widget _buildGoogleMap(List<List<LatLng>>? paths) {
+  Widget _buildGoogleMap(List<List<List<LatLng>>>? paths) {
     final center = _initialCameraTarget();
-    final hasPath = paths != null && paths.any((p) => p.isNotEmpty);
+    final hasPath =
+        paths != null && paths.any((leg) => leg.any((s) => s.isNotEmpty));
     final screenH = MediaQuery.sizeOf(context).height;
 
     return GoogleMap(
-      key: ValueKey(
-        'trip_map_${widget.request.requestId}_'
-        '${_initialCameraTarget().latitude}_${_initialCameraTarget().longitude}',
-      ),
+      key: ValueKey('trip_map_${widget.request.requestId}'),
       initialCameraPosition: CameraPosition(target: center, zoom: 14),
       polylines: _buildPolylines(paths),
       markers: hasPath ? _buildMarkers(paths) : _buildPlannedMarkers(),
@@ -614,8 +839,16 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         WidgetsBinding.instance.addPostFrameCallback((_) {
           _lastCameraTarget = null;
           _lastCameraPathSig = null;
+          _userMovedCamera = false;
           _moveCameraToStartIfNeeded();
         });
+      },
+      onCameraMoveStarted: () {
+        // User panned/zoomed — stop fighting their gesture with auto-fit.
+        if (_isLiveTrip || _isLiveServer) {
+          _userMovedCamera = true;
+          _cameraFollowLive = false;
+        }
       },
       padding: EdgeInsets.only(
         top: MediaQuery.paddingOf(context).top + 72,
@@ -627,18 +860,18 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       compassEnabled: false,
       rotateGesturesEnabled: true,
       tiltGesturesEnabled: false,
-      webGestureHandling:
-          kIsWeb ? WebGestureHandling.cooperative : null,
+      webGestureHandling: kIsWeb ? WebGestureHandling.cooperative : null,
     );
   }
 
-  Widget _buildOsmMap(List<List<LatLng>>? paths) {
+  Widget _buildOsmMap(List<List<List<LatLng>>>? paths) {
     final start = tripMapStartTarget(widget.request);
     final dest = tripMapDestinationTarget(widget.request);
     final fallback = start ?? dest ?? const LatLng(23.0225, 72.5714);
-    final flattened = paths != null && paths.any((p) => p.isNotEmpty)
-        ? _flattenPaths(paths)
-        : [start ?? dest ?? fallback];
+    final flattened =
+        paths != null && paths.any((leg) => leg.any((s) => s.isNotEmpty))
+            ? _flattenPaths(paths)
+            : [start ?? dest ?? fallback];
 
     return RoutePolylineMapView(
       key: ValueKey(
@@ -655,8 +888,8 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   @override
   Widget build(BuildContext context) {
     final pts = _activePoints;
-    final loading =
-        pts == null && _routePointsFuture != null && _resolvedPoints == null;
+    // Loader only on first paint — never flash while reconciling live GPS.
+    final loading = pts == null && _resolvedPoints == null;
     final screenH = MediaQuery.sizeOf(context).height;
     final actionChild = _resolveActionChild(context);
 
@@ -726,92 +959,91 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
                 onPressed:
                     widget.onBack ?? () => Navigator.of(context).maybePop(),
               ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Material(
-                elevation: 4,
-                shadowColor: Colors.black26,
-                borderRadius: BorderRadius.circular(16),
-                color: Colors.white,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 10,
-                  ),
-                  child: Row(
-                    children: [
-                      if (_isLiveTrip || _isLiveServer) ...[
-                        AnimatedBuilder(
-                          animation: _livePulse,
-                          builder: (context, child) {
-                            final t = 0.45 + _livePulse.value * 0.55;
-                            return Container(
-                              width: 10,
-                              height: 10,
-                              decoration: BoxDecoration(
-                                color: AppColors.success.withValues(alpha: t),
-                                shape: BoxShape.circle,
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: AppColors.success
-                                        .withValues(alpha: 0.35 * t),
-                                    blurRadius: 8,
-                                    spreadRadius: 2,
-                                  ),
-                                ],
+              const SizedBox(width: 10),
+              Expanded(
+                child: Material(
+                  elevation: 4,
+                  shadowColor: Colors.black26,
+                  borderRadius: BorderRadius.circular(16),
+                  color: Colors.white,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 10,
+                    ),
+                    child: Row(
+                      children: [
+                        if (_isLiveTrip || _isLiveServer) ...[
+                          AnimatedBuilder(
+                            animation: _livePulse,
+                            builder: (context, child) {
+                              final t = 0.45 + _livePulse.value * 0.55;
+                              return Container(
+                                width: 10,
+                                height: 10,
+                                decoration: BoxDecoration(
+                                  color: AppColors.success.withValues(alpha: t),
+                                  shape: BoxShape.circle,
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: AppColors.success
+                                          .withValues(alpha: 0.35 * t),
+                                      blurRadius: 8,
+                                      spreadRadius: 2,
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                          const SizedBox(width: 8),
+                        ],
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                request.status,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: AppTextStyles.labelMedium.copyWith(
+                                  color: statusColor,
+                                  fontWeight: FontWeight.w800,
+                                  letterSpacing: 0.2,
+                                ),
                               ),
-                            );
-                          },
+                              Text(
+                                request.routeSummary,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: AppTextStyles.labelSmall.copyWith(
+                                  color: AppColors.textSecondary,
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
-                        const SizedBox(width: 8),
                       ],
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              request.status,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: AppTextStyles.labelMedium.copyWith(
-                                color: statusColor,
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: 0.2,
-                              ),
-                            ),
-                            Text(
-                              request.routeSummary,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: AppTextStyles.labelSmall.copyWith(
-                                color: AppColors.textSecondary,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
+                    ),
                   ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
-    ),
     );
   }
 
-  Widget _buildMapControls(List<List<LatLng>>? pts, double screenH) {
+  Widget _buildMapControls(List<List<List<LatLng>>>? pts, double screenH) {
     final flattened = _flattenPaths(pts);
     final hasPath = flattened.isNotEmpty;
     if (!hasPath) return const SizedBox.shrink();
 
     // Stay above the sheet; lift further when the action button floats there too.
-    final actionLift = _hasActionButton
-        ? (_actionButtonHeight + 12) * (1 - _actionPinT)
-        : 0.0;
+    final actionLift =
+        _hasActionButton ? (_actionButtonHeight + 12) * (1 - _actionPinT) : 0.0;
     final bottomOffset = _aboveSheetBottom(screenH, gap: 12) + actionLift;
 
     return Positioned(
@@ -974,8 +1206,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         final sheet = DecoratedBox(
           decoration: BoxDecoration(
             color: AppColors.surface,
-            borderRadius:
-                const BorderRadius.vertical(top: Radius.circular(24)),
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
             boxShadow: [
               BoxShadow(
                 color: Colors.black.withValues(alpha: 0.12),
@@ -994,24 +1225,30 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
                         behavior: HitTestBehavior.opaque,
                         onVerticalDragUpdate: (details) =>
                             _dragSheetBy(details.delta.dy),
-                        child: _RoutePreviewStrip(
-                          from: leg?.fromLocation ?? request.fromLocation,
-                          to: leg?.toLocation ?? request.toLocation,
-                          distanceKm: request.effectiveDistanceKm > 0
-                              ? request.effectiveDistanceKm
-                              : request.distance,
-                          distanceLabel: request.displayDistanceLabel,
-                          isLive: _isLiveTrip,
+                        child: Builder(
+                          builder: (context) {
+                            final dist = _sheetDistance(request);
+                            return _RoutePreviewStrip(
+                              from: leg?.fromLocation ?? request.fromLocation,
+                              to: leg?.toLocation ?? request.toLocation,
+                              distanceKm: dist.$1,
+                              distanceLabel: dist.$2,
+                              isLive: _isLiveTrip,
+                            );
+                          },
                         ),
                       )
-                    : _RoutePreviewStrip(
-                        from: leg?.fromLocation ?? request.fromLocation,
-                        to: leg?.toLocation ?? request.toLocation,
-                        distanceKm: request.effectiveDistanceKm > 0
-                            ? request.effectiveDistanceKm
-                            : request.distance,
-                        distanceLabel: request.displayDistanceLabel,
-                        isLive: _isLiveTrip,
+                    : Builder(
+                        builder: (context) {
+                          final dist = _sheetDistance(request);
+                          return _RoutePreviewStrip(
+                            from: leg?.fromLocation ?? request.fromLocation,
+                            to: leg?.toLocation ?? request.toLocation,
+                            distanceKm: dist.$1,
+                            distanceLabel: dist.$2,
+                            isLive: _isLiveTrip,
+                          );
+                        },
                       ),
               ),
               const SizedBox(height: 12),

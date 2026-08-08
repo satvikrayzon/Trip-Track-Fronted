@@ -423,6 +423,11 @@ class HiveDatabase {
     await _routePointsBox?.put(id, Map<String, dynamic>.from(pointMap));
   }
 
+  Future<void> deleteRoutePoint(String pointId) async {
+    if (pointId.isEmpty) return;
+    await _routePointsBox?.delete(pointId);
+  }
+
   Future<List<Map<String, dynamic>>> getRoutePointsForRequest(
       String requestId) async {
     final box = _routePointsBox;

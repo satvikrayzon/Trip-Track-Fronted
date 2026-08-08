@@ -62,9 +62,9 @@ class LiveMapNotifier extends StateNotifier<LiveMapState> {
   bool _started = false;
   DateTime? _lastSocketLocationAt;
 
-  static const _socketFreshness = Duration(seconds: 45);
+  static const _socketFreshness = Duration(seconds: 20);
   static const _socketMetadataSync = Duration(minutes: 2);
-  static const _httpFallbackPoll = Duration(seconds: 60);
+  static const _httpFallbackPoll = Duration(seconds: 20);
 
   Future<void> start() async {
     if (_started || !mounted) return;
@@ -83,17 +83,17 @@ class LiveMapNotifier extends StateNotifier<LiveMapState> {
 
     _sub = ws.employeesStream.listen((employees) {
       if (!mounted || employees.isEmpty) return;
-      _lastSocketLocationAt = DateTime.now();
+      // Do NOT bump _lastSocketLocationAt here — metadata-only events were
+      // marking socket "fresh" and blocking HTTP route polls for admin live.
       for (final e in employees) {
         final prev = _roster[e.id];
         _roster[e.id] = prev == null ? e : _mergeProfile(prev, e);
       }
-      _applyEmployees(liveViaSocket: true);
+      _applyEmployees(liveViaSocket: ws.isConnected);
     });
 
     _locSub = ws.locationUpdates.listen((data) {
       if (!mounted) return;
-      _lastSocketLocationAt = DateTime.now();
 
       final userId = data['userId']?.toString() ?? '';
       final requestId = data['requestId']?.toString() ?? '';
@@ -123,22 +123,31 @@ class LiveMapNotifier extends StateNotifier<LiveMapState> {
         final lat = (data['latitude'] as num?)?.toDouble();
         final lng = (data['longitude'] as num?)?.toDouble();
         if (lat != null && lng != null) {
+          _lastSocketLocationAt = DateTime.now();
           final speed = (data['speed'] as num?)?.toDouble() ?? 0.0;
-          final bearing = (data['heading'] ?? data['bearing'] as num?)?.toDouble() ?? 0.0;
+          final bearing =
+              (data['heading'] ?? data['bearing'] as num?)?.toDouble() ?? 0.0;
           final newPoint = LatLng(lat, lng);
 
           final updatedEmployee = existing.copyWith(
             position: newPoint,
             path: existing.path.isEmpty
                 ? [existing.position, newPoint]
-                : (existing.path.last != newPoint ? [...existing.path, newPoint] : existing.path),
+                : (existing.path.last != newPoint
+                    ? [...existing.path, newPoint]
+                    : existing.path),
             speedKmh: speed * 3.6,
             bearing: bearing,
-            lastUpdated: DateTime.tryParse(data['timestamp']?.toString() ?? '') ?? DateTime.now(),
+            lastUpdated:
+                DateTime.tryParse(data['timestamp']?.toString() ?? '') ??
+                    DateTime.now(),
           );
           _roster[foundKey] = updatedEmployee;
           _applyEmployees(liveViaSocket: true);
         }
+      } else {
+        // Unknown employee — force HTTP refresh so admin doesn't stay stale.
+        unawaited(refresh(force: true, quiet: true));
       }
     });
 

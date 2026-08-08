@@ -1,11 +1,11 @@
 import 'dart:async';
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
-import '../services/distance_service.dart';
 import '../utils/google_map_controller_utils.dart';
+import '../utils/geo_utils.dart';
+import '../utils/route_point_simplify.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text_styles.dart';
 import '../../modules/travel/data/models/travel_request_model.dart';
@@ -13,6 +13,7 @@ import 'google_map_web_gate.dart';
 import 'route_polyline_map_view.dart';
 import 'trip_route_map_data.dart';
 import '../services/background_location_service.dart';
+import '../services/gps_gap_road_fill.dart';
 import '../../features/tracking/data/services/websocket_tracking_service.dart';
 import '../di/service_locator.dart';
 
@@ -41,23 +42,15 @@ class _TripRouteFullscreenMapScreenState
   bool _mapCreated = false;
   late TabController _tabs;
 
-  List<List<LatLng>> _legPaths = [];
+  List<List<List<LatLng>>> _legPaths = [];
+  List<List<LatLng>> _wholePath = [];
   bool _traveledLoading = true;
   String? _traveledError;
   BackgroundLocationService? _bgLocationService;
   StreamSubscription? _wsLocationSub;
   StreamSubscription? _wsConnSub;
 
-  final _distanceService = DistanceService();
-
-  static const List<Color> _legColors = [
-    AppColors.primary,
-    Colors.orange,
-    Colors.purple,
-    Colors.teal,
-    Colors.brown,
-    Colors.indigo,
-  ];
+  static const List<Color> _legColors = AppColors.legTrailColors;
 
   int get _tabCount {
     if (widget.request.tripLegs.isEmpty) return 1; // Path traveled
@@ -81,6 +74,11 @@ class _TripRouteFullscreenMapScreenState
     return labels;
   }
 
+  Timer? _localPointsDebounce;
+  int _loadGeneration = 0;
+  bool _userMovedCamera = false;
+  bool _initialFitDone = false;
+
   @override
   void initState() {
     super.initState();
@@ -102,7 +100,7 @@ class _TripRouteFullscreenMapScreenState
         unawaited(ws.connect());
       }
       ws.joinTripRoom(widget.request.requestId);
-      
+
       _wsLocationSub = ws.locationUpdates.listen((payload) {
         final tid = payload['tripId'] ?? payload['requestId'];
         if (tid == widget.request.requestId) {
@@ -113,7 +111,6 @@ class _TripRouteFullscreenMapScreenState
             final latLng = LatLng(lat, lng);
             _onLiveLocationReceived(latLng, legId);
           }
-        } else {
         }
       });
       _wsConnSub = ws.connectionStream.listen((connected) {
@@ -121,45 +118,115 @@ class _TripRouteFullscreenMapScreenState
           ws.joinTripRoom(widget.request.requestId);
         }
       });
-    } else {
     }
 
-    _loadTraveled();
+    _loadTraveled(isInitial: true);
   }
 
   void _onLocalPointsUpdated() {
-    if (_bgLocationService?.activeRequestId == widget.request.requestId) {
-      evictRoutePointsCache(widget.request.requestId);
-      _loadTraveled();
+    if (_bgLocationService?.activeRequestId != widget.request.requestId) {
+      return;
     }
+    _localPointsDebounce?.cancel();
+    _localPointsDebounce = Timer(const Duration(seconds: 8), () {
+      if (!mounted) return;
+      evictRoutePointsCache(widget.request.requestId);
+      _loadTraveled(isInitial: false);
+    });
+  }
+
+  void _appendLivePoint(int legIndex, LatLng point) {
+    if (legIndex < 0 || legIndex >= _legPaths.length) return;
+    final segments = _legPaths[legIndex];
+    if (segments.isEmpty) {
+      _legPaths[legIndex] = [
+        [point],
+      ];
+      return;
+    }
+    final lastSeg = segments.last;
+    if (lastSeg.isNotEmpty && lastSeg.last == point) return;
+    if (lastSeg.isNotEmpty) {
+      final prev = lastSeg.last;
+      final jump = GeoUtils.distanceMeters(
+        prev.latitude,
+        prev.longitude,
+        point.latitude,
+        point.longitude,
+      );
+      // Never paint a live chord across a kill/reopen hop — soft reload.
+      if (jump > GpsGapRoadFill.breakChordMeters) {
+        evictRoutePointsCache(widget.request.requestId);
+        unawaited(_loadTraveled(isInitial: false));
+        return;
+      }
+    }
+    _legPaths[legIndex] = [
+      ...segments.sublist(0, segments.length - 1),
+      [...lastSeg, point],
+    ];
   }
 
   void _onLiveLocationReceived(LatLng point, String? legId) {
     if (!mounted) return;
     setState(() {
+      // Keep Whole route tip flowing (tab 0 paints _wholePath).
+      if (_wholePath.isEmpty) {
+        _wholePath = [
+          [point],
+        ];
+      } else {
+        final lastSeg = _wholePath.last;
+        if (lastSeg.isEmpty || lastSeg.last != point) {
+          final prev = lastSeg.isEmpty ? null : lastSeg.last;
+          final jump = prev == null
+              ? 0.0
+              : GeoUtils.distanceMeters(
+                  prev.latitude,
+                  prev.longitude,
+                  point.latitude,
+                  point.longitude,
+                );
+          if (jump > GpsGapRoadFill.breakChordMeters) {
+            evictRoutePointsCache(widget.request.requestId);
+            unawaited(_loadTraveled(isInitial: false));
+          } else if (jump >= 4 || prev == null) {
+            _wholePath = [
+              ..._wholePath.sublist(0, _wholePath.length - 1),
+              [...lastSeg, point],
+            ];
+          }
+        }
+      }
+
       if (_legPaths.isEmpty) {
-        _legPaths = [[point]];
+        _legPaths = [
+          [
+            [point],
+          ],
+        ];
         return;
       }
-      
+
       if (legId != null && legId.isNotEmpty) {
-        final legIndex = widget.request.tripLegs.indexWhere((l) => l.legId == legId);
+        final legIndex =
+            widget.request.tripLegs.indexWhere((l) => l.legId == legId);
         if (legIndex >= 0 && legIndex < _legPaths.length) {
-          final path = _legPaths[legIndex];
-          if (path.isEmpty || path.last != point) {
-            _legPaths[legIndex] = [...path, point];
-          }
+          _appendLivePoint(legIndex, point);
           return;
         }
       }
-      
+
       final activeIndex = widget.request.currentLegIndex;
       final targetIndex = activeIndex.clamp(0, _legPaths.length - 1);
-      final path = _legPaths[targetIndex];
-      if (path.isEmpty || path.last != point) {
-        _legPaths[targetIndex] = [...path, point];
-      }
+      _appendLivePoint(targetIndex, point);
     });
+    if (!_userMovedCamera) {
+      final c = _controller;
+      if (c != null) {
+        unawaited(c.animateCamera(CameraUpdate.newLatLng(point)));
+      }
+    }
   }
 
   void _onTabChanged() {
@@ -171,38 +238,52 @@ class _TripRouteFullscreenMapScreenState
   }
 
   List<LatLng> _pointsForTab(int index) {
-    if (_legPaths.isEmpty) return [];
     if (index == 0) {
-      final all = <LatLng>[];
-      for (final p in _legPaths) {
-        all.addAll(p);
+      if (_legPaths.isNotEmpty) {
+        return [
+          for (final leg in _legPaths)
+            for (final seg in leg) ...seg,
+        ];
       }
-      return all;
+      return [for (final seg in _wholePath) ...seg];
     }
+    if (_legPaths.isEmpty) return [];
     final legIndex = index - 1;
     if (legIndex >= 0 && legIndex < _legPaths.length) {
-      return _legPaths[legIndex];
+      return [
+        for (final seg in _legPaths[legIndex]) ...seg,
+      ];
     }
     return [];
   }
 
-  Future<void> _loadTraveled() async {
-    setState(() {
-      _traveledLoading = true;
-      _traveledError = null;
-    });
-    try {
-      final paths = await loadTraveledLegPoints(widget.request);
-      if (!mounted) return;
+  Future<void> _loadTraveled({bool isInitial = false}) async {
+    final gen = ++_loadGeneration;
+    // Only show blocking loader on first open — never unmount map on live ticks.
+    if (isInitial || (_wholePath.isEmpty && _legPaths.isEmpty)) {
       setState(() {
+        _traveledLoading = true;
+        _traveledError = null;
+      });
+    }
+    try {
+      final whole = await loadWholeTripPathFilled(widget.request);
+      final paths = await loadTraveledLegPoints(widget.request);
+      if (!mounted || gen != _loadGeneration) return;
+      setState(() {
+        _wholePath = whole;
         _legPaths = paths;
         _traveledLoading = false;
+        _traveledError = null;
       });
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _fitCamera(_pointsForTab(_tabs.index));
-      });
-    } catch (e, st) {
-      if (!mounted) return;
+      if (!_userMovedCamera && (!_initialFitDone || isInitial)) {
+        _initialFitDone = true;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _fitCamera(_pointsForTab(_tabs.index));
+        });
+      }
+    } catch (e) {
+      if (!mounted || gen != _loadGeneration) return;
       setState(() {
         _traveledError = '$e';
         _traveledLoading = false;
@@ -251,12 +332,15 @@ class _TripRouteFullscreenMapScreenState
 
   @override
   void dispose() {
+    _localPointsDebounce?.cancel();
     _bgLocationService?.pointsBuffered.removeListener(_onLocalPointsUpdated);
     _wsLocationSub?.cancel();
     _wsConnSub?.cancel();
     if (ServiceLocator.I.has<WebSocketTrackingService>()) {
       try {
-        ServiceLocator.I.get<WebSocketTrackingService>().leaveTripRoom(widget.request.requestId);
+        ServiceLocator.I
+            .get<WebSocketTrackingService>()
+            .leaveTripRoom(widget.request.requestId);
       } catch (_) {}
     }
     _tabs.removeListener(_onTabChanged);
@@ -268,45 +352,180 @@ class _TripRouteFullscreenMapScreenState
   }
 
   Set<Polyline> _traveledPolylines(int tabIndex) {
-    if (_legPaths.isEmpty) return {};
-
     if (tabIndex == 0) {
+      // Whole route: prefer ONE chronological road-aligned path, then color by
+      // leg time windows — avoids stacking overlapping per-leg "extra lines".
       final set = <Polyline>{};
-      for (var i = 0; i < _legPaths.length; i++) {
-        final pts = _legPaths[i];
-        if (pts.length < 2) continue;
-        set.add(
-          Polyline(
-            polylineId: PolylineId('traveled_$i'),
-            points: pts,
-            color: _legColors[i % _legColors.length],
-            width: 6,
-            jointType: JointType.round,
-            startCap: Cap.roundCap,
-            endCap: Cap.roundCap,
-          ),
-        );
+      if (_wholePath.isNotEmpty) {
+        final flat = [for (final seg in _wholePath) ...seg];
+        if (flat.length >= 2) {
+          final colored = _colorWholePathByLegs(flat);
+          for (var i = 0; i < colored.length; i++) {
+            final piece = colored[i];
+            if (piece.points.length < 2) continue;
+            final pieces = mapDisplayRouteSegments(
+              piece.points,
+              maxEdgeMeters: kAlignedMapMaxEdgeMeters,
+            );
+            for (var p = 0; p < pieces.length; p++) {
+              final display = pieces[p];
+              if (display.length < 2) continue;
+              set.add(
+                Polyline(
+                  polylineId: PolylineId('traveled_whole_${i}_$p'),
+                  points: display,
+                  color: piece.color,
+                  width: 6,
+                  jointType: JointType.round,
+                  startCap: Cap.roundCap,
+                  endCap: Cap.roundCap,
+                ),
+              );
+            }
+          }
+          return set;
+        }
+      }
+      if (_legPaths.isNotEmpty) {
+        for (var i = 0; i < _legPaths.length; i++) {
+          final color = _legColors[i % _legColors.length];
+          for (var s = 0; s < _legPaths[i].length; s++) {
+            final pieces = mapDisplayRouteSegments(
+              _legPaths[i][s],
+              maxEdgeMeters: kAlignedMapMaxEdgeMeters,
+            );
+            for (var p = 0; p < pieces.length; p++) {
+              final display = pieces[p];
+              if (display.length < 2) continue;
+              set.add(
+                Polyline(
+                  polylineId: PolylineId('traveled_whole_${i}_${s}_$p'),
+                  points: display,
+                  color: color,
+                  width: 6,
+                  jointType: JointType.round,
+                  startCap: Cap.roundCap,
+                  endCap: Cap.roundCap,
+                ),
+              );
+            }
+          }
+        }
+        return set;
       }
       return set;
-    } else {
-      final legIndex = tabIndex - 1;
-      if (legIndex >= 0 && legIndex < _legPaths.length) {
-        final pts = _legPaths[legIndex];
-        if (pts.length < 2) return {};
-        return {
-          Polyline(
-            polylineId: PolylineId('traveled_leg_$legIndex'),
-            points: pts,
-            color: _legColors[legIndex % _legColors.length],
-            width: 6,
-            jointType: JointType.round,
-            startCap: Cap.roundCap,
-            endCap: Cap.roundCap,
-          ),
-        };
+    }
+
+    if (_legPaths.isEmpty) return {};
+    final legIndex = tabIndex - 1;
+    if (legIndex >= 0 && legIndex < _legPaths.length) {
+      final color = _legColors[legIndex % _legColors.length];
+      final set = <Polyline>{};
+      for (var s = 0; s < _legPaths[legIndex].length; s++) {
+        final pieces = mapDisplayRouteSegments(
+          _legPaths[legIndex][s],
+          maxEdgeMeters: kAlignedMapMaxEdgeMeters,
+        );
+        for (var p = 0; p < pieces.length; p++) {
+          final pts = pieces[p];
+          if (pts.length < 2) continue;
+          set.add(
+            Polyline(
+              polylineId: PolylineId('traveled_leg_${legIndex}_${s}_$p'),
+              points: pts,
+              color: color,
+              width: 6,
+              jointType: JointType.round,
+              startCap: Cap.roundCap,
+              endCap: Cap.roundCap,
+            ),
+          );
+        }
       }
+      return set;
     }
     return {};
+  }
+
+  /// Split one chronological trail into per-leg colors without stacking overlays.
+  List<({List<LatLng> points, Color color})> _colorWholePathByLegs(
+    List<LatLng> flat,
+  ) {
+    final legCount = widget.request.tripLegs.isNotEmpty
+        ? widget.request.tripLegs.length
+        : (_legPaths.isNotEmpty ? _legPaths.length : 1);
+    if (legCount <= 1 || flat.length < 4) {
+      return [
+        (points: flat, color: _legColors[0]),
+      ];
+    }
+
+    // Prefer proportional split by each leg's own path length when available.
+    final weights = <double>[];
+    for (var i = 0; i < legCount; i++) {
+      var w = 0.0;
+      if (i < _legPaths.length) {
+        for (final seg in _legPaths[i]) {
+          for (var j = 1; j < seg.length; j++) {
+            w += GeoUtils.distanceMeters(
+              seg[j - 1].latitude,
+              seg[j - 1].longitude,
+              seg[j].latitude,
+              seg[j].longitude,
+            );
+          }
+        }
+      }
+      weights.add(w > 1 ? w : 1.0);
+    }
+    final weightSum = weights.fold<double>(0, (a, b) => a + b);
+
+    final totalM = <double>[0];
+    for (var i = 1; i < flat.length; i++) {
+      totalM.add(
+        totalM.last +
+            GeoUtils.distanceMeters(
+              flat[i - 1].latitude,
+              flat[i - 1].longitude,
+              flat[i].latitude,
+              flat[i].longitude,
+            ),
+      );
+    }
+    final pathLen = totalM.last;
+    if (pathLen < 1) {
+      return [(points: flat, color: _legColors[0])];
+    }
+
+    final out = <({List<LatLng> points, Color color})>[];
+    var cursor = 0.0;
+    var startIdx = 0;
+    for (var leg = 0; leg < legCount; leg++) {
+      final share = weights[leg] / weightSum;
+      final target = leg == legCount - 1
+          ? pathLen
+          : (cursor + share * pathLen).clamp(0.0, pathLen).toDouble();
+      cursor = target;
+      var endIdx = startIdx;
+      while (endIdx < flat.length - 1 && totalM[endIdx] < target) {
+        endIdx++;
+      }
+      if (leg == legCount - 1) endIdx = flat.length - 1;
+      if (endIdx <= startIdx) {
+        endIdx = (startIdx + 1).clamp(0, flat.length - 1);
+      }
+      final slice = flat.sublist(startIdx, endIdx + 1);
+      if (slice.length >= 2) {
+        out.add((
+          points: slice,
+          color: _legColors[leg % _legColors.length],
+        ));
+      }
+      startIdx = endIdx;
+    }
+    return out.isEmpty
+        ? [(points: flat, color: _legColors[0])]
+        : out;
   }
 
   Set<Marker> _traveledMarkers(int tabIndex) {
@@ -449,12 +668,7 @@ class _TripRouteFullscreenMapScreenState
     required LatLng initialTarget,
     required VoidCallback onReadyFit,
   }) {
-    if (loading) {
-      return const Center(
-        child: CircularProgressIndicator(color: AppColors.white),
-      );
-    }
-    if (error != null) {
+    if (error != null && polylines.isEmpty) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -466,6 +680,7 @@ class _TripRouteFullscreenMapScreenState
         ),
       );
     }
+    // Keep GoogleMap mounted — overlay spinner only on first load.
     return Stack(
       children: [
         GoogleMapWebGate(
@@ -478,6 +693,7 @@ class _TripRouteFullscreenMapScreenState
             height: null,
           ),
           builder: (context) => GoogleMap(
+            key: ValueKey('fs_map_${widget.request.requestId}'),
             initialCameraPosition:
                 CameraPosition(target: initialTarget, zoom: 12),
             polylines: polylines,
@@ -487,6 +703,9 @@ class _TripRouteFullscreenMapScreenState
               _mapCreated = true;
               WidgetsBinding.instance.addPostFrameCallback((_) => onReadyFit());
             },
+            onCameraMoveStarted: () {
+              _userMovedCamera = true;
+            },
             myLocationButtonEnabled: true,
             myLocationEnabled: true,
             zoomControlsEnabled: true,
@@ -494,7 +713,16 @@ class _TripRouteFullscreenMapScreenState
             compassEnabled: true,
           ),
         ),
-        if (polylines.isEmpty)
+        if (loading)
+          const Positioned.fill(
+            child: ColoredBox(
+              color: Color(0x33000000),
+              child: Center(
+                child: CircularProgressIndicator(color: AppColors.white),
+              ),
+            ),
+          ),
+        if (!loading && polylines.isEmpty)
           Positioned(
             top: 24,
             left: 24,
@@ -507,8 +735,8 @@ class _TripRouteFullscreenMapScreenState
                 child: Text(
                   emptyMessage,
                   textAlign: TextAlign.center,
-                  style:
-                      AppTextStyles.bodyMedium.copyWith(color: AppColors.white),
+                  style: AppTextStyles.bodyMedium
+                      .copyWith(color: AppColors.white),
                 ),
               ),
             ),

@@ -20,6 +20,7 @@ import '../../../../core/services/sync_service.dart';
 import '../../../../core/services/tracking_coverage_service.dart';
 import '../../../../core/services/tracking_event_service.dart';
 import '../../../../core/services/tracking_session_service.dart';
+import '../../../../core/services/trip_road_metrics_service.dart';
 import '../../../travel/data/models/route_segment_model.dart';
 import '../../../../core/theme/app_colors.dart';
 import '../../../../features/tracking/data/services/trip_realtime_binder.dart';
@@ -28,15 +29,10 @@ import '../../../auth/presentation/controllers/app_auth_controller.dart';
 import '../../../../core/services/active_trip_restore_service.dart';
 import '../../../../core/widgets/trip_route_map_data.dart';
 import '../../../travel/data/datasources/travel_request_remote_datasource.dart';
-import '../../../../core/utils/app_debug_log.dart';
 import '../../../travel/data/models/tracking_coverage_model.dart';
-import '../../../../core/services/distance_service.dart';
-import '../../../../core/config/google_maps_config.dart';
 import '../../../travel/data/models/travel_request_model.dart';
 import '../../../travel/services/travel_request_delete_service.dart';
 import '../../../../core/network/failures/network_failure.dart';
-import '../../../../core/services/track_analytics.dart';
-import '../../../travel/data/models/route_point_model.dart';
 import '../../../../core/utils/geo_utils.dart';
 
 /// Controller for Request Details Screen with offline support.
@@ -178,13 +174,17 @@ class RequestDetailsController {
                 ),
           );
         }
-        if (seed.status == 'Travelling' || seed.status == 'Returning' || seed.trackingStatus == 'tracking') {
+        if (seed.status == 'Travelling' ||
+            seed.status == 'Returning' ||
+            seed.trackingStatus == 'tracking') {
           final bg = ServiceLocator.I.get<BackgroundLocationService>();
           if (!bg.isRunning) {
             final session = ServiceLocator.I.get<TrackingSessionService>();
             unawaited(session.onTravelDeparture(
               requestId: seed.requestId,
-              legId: seed.activeLeg?.legId ?? seed.tripLegs.firstOrNull?.legId ?? '',
+              legId: seed.activeLeg?.legId ??
+                  seed.tripLegs.firstOrNull?.legId ??
+                  '',
               sessionId: seed.trackingSessionId ?? '',
             ));
           }
@@ -215,9 +215,26 @@ class RequestDetailsController {
   ) async {
     if (!ServiceLocator.I.has<MapMatchingService>()) return current;
     try {
-      return await ServiceLocator.I
-          .get<MapMatchingService>()
-          .enhanceWithOfficialMatch(current);
+      final matcher = ServiceLocator.I.get<MapMatchingService>();
+      final updated = await matcher.enhanceWithOfficialMatch(current);
+
+      // Completed trips: always rematch so Nest Directions gap-fill rebuilds
+      // the official road polyline (old matches still store straight chords).
+      final completed = updated.status == AppConstants.statusCompleted ||
+          updated.tripEndedAt != null;
+      if (completed) {
+        final id = updated.restResourceId.isNotEmpty
+            ? updated.restResourceId
+            : updated.requestId;
+        unawaited(() async {
+          final match = await matcher.triggerMatch(id, reason: 'manual');
+          if (match == null || !match.isReady) return;
+          final cur = request.value;
+          if (cur == null) return;
+          request.value = await matcher.applyMatchToRequest(cur, match);
+        }());
+      }
+      return updated;
     } catch (_) {
       return current;
     }
@@ -363,18 +380,8 @@ class RequestDetailsController {
           if (currentPath.isEmpty || currentPath.last != latLng) {
             currentPath.add(latLng);
             adminLivePath.value = currentPath;
-
-            final currentRequest = request.value;
-            if (currentRequest != null) {
-              final updatedRoutePoints =
-                  List<Map<String, dynamic>>.from(currentRequest.routePoints)
-                    ..add(Map<String, dynamic>.from(payload));
-              request.value = currentRequest.copyWith(
-                routePoints: updatedRoutePoints,
-                routePointCount: updatedRoutePoints.length,
-              );
-            }
-            evictRoutePointsCache(requestId);
+            // Do NOT rewrite request.routePoints every GPS tick — that rebuilt
+            // the whole map (loader + erase). Trail paint appends from adminLivePath.
           }
         }
       }
@@ -393,7 +400,9 @@ class RequestDetailsController {
     });
 
     _pollTimer = Timer.periodic(
-      _canFetchServerTrail ? const Duration(seconds: 15) : const Duration(seconds: 30),
+      _canFetchServerTrail
+          ? const Duration(seconds: 15)
+          : const Duration(seconds: 30),
       (_) {
         if (_tripRealtime?.isLive == true) return;
         unawaited(_pullRequestFromApi(requestId));
@@ -473,7 +482,8 @@ class RequestDetailsController {
         cacheServerRoutePoints(r.requestId, path);
         adminLivePath.value = path;
 
-        final rawList = data.map((d) => Map<String, dynamic>.from(d as Map)).toList();
+        final rawList =
+            data.map((d) => Map<String, dynamic>.from(d as Map)).toList();
         request.value = r.copyWith(routePoints: rawList);
       case ApiFailure(:final failure):
         break;
@@ -745,7 +755,8 @@ class RequestDetailsController {
             currentRequest.trackingSessionId;
         var tripStarted =
             updatedRequest.tripStartedAt ?? currentRequest.tripStartedAt;
-        var tripEnded = updatedRequest.tripEndedAt ?? currentRequest.tripEndedAt;
+        var tripEnded =
+            updatedRequest.tripEndedAt ?? currentRequest.tripEndedAt;
         var trackStatus =
             updatedRequest.trackingStatus ?? currentRequest.trackingStatus;
 
@@ -825,9 +836,29 @@ class RequestDetailsController {
 
         unawaited(_syncRoutePointCountToApi(updatedRequest.requestId));
         if (ServiceLocator.I.has<SyncService>()) {
-          unawaited(
-            ServiceLocator.I.get<SyncService>().uploadPendingRoutePoints(),
-          );
+          // Trip end: await catch-up so server has resume/filler points before
+          // admin/completed maps load from listRoutePoints.
+          final ended = punchType == 'travel_arrival' &&
+              (updatedRequest.activeLeg ?? activeLeg).isReturnLeg;
+          if (ended) {
+            await ServiceLocator.I
+                .get<SyncService>()
+                .uploadPendingRoutePoints();
+            if (ServiceLocator.I.has<MapMatchingService>()) {
+              unawaited(
+                ServiceLocator.I.get<MapMatchingService>().triggerMatch(
+                      updatedRequest.restResourceId.isNotEmpty
+                          ? updatedRequest.restResourceId
+                          : updatedRequest.requestId,
+                      reason: 'trip_end',
+                    ),
+              );
+            }
+          } else {
+            unawaited(
+              ServiceLocator.I.get<SyncService>().uploadPendingRoutePoints(),
+            );
+          }
         }
         logReturnArrival('done, showing success');
         _showSuccess('Punch saved with time and GPS location');
@@ -910,7 +941,8 @@ class RequestDetailsController {
     }
 
     final newLeg = TripLegModel(
-      legId: 'leg_${current.tripLegs.length + 1}_${DateTime.now().millisecondsSinceEpoch}',
+      legId:
+          'leg_${current.tripLegs.length + 1}_${DateTime.now().millisecondsSinceEpoch}',
       sequence: current.tripLegs.length + 1,
       fromLocation: fromLocation,
       toLocation: destination,
@@ -919,16 +951,14 @@ class RequestDetailsController {
       clientOfficeAddress: destination,
     );
 
-    return current
-        .copyWith(
-          tripLegs: [...current.tripLegs, newLeg],
-          toLocation: destination,
-          clientName: clientName,
-          purpose: purpose,
-          apiHasDeparted: false,
-          apiCanMarkArrival: false,
-        )
-        .withRecalculatedSummary(statusOverride: AppConstants.statusReadyToStart);
+    return current.copyWith(
+      tripLegs: [...current.tripLegs, newLeg],
+      toLocation: destination,
+      clientName: clientName,
+      purpose: purpose,
+      apiHasDeparted: false,
+      apiCanMarkArrival: false,
+    ).withRecalculatedSummary(statusOverride: AppConstants.statusReadyToStart);
   }
 
   Future<void> startReturnTrip() async {
@@ -979,6 +1009,7 @@ class RequestDetailsController {
       isLoading.value = false;
     }
   }
+
   Future<void> _syncRoutePointCountToApi(String logicalRequestId) async {
     try {
       final c = await _hiveDb.countRoutePointsForRequest(logicalRequestId);
@@ -996,198 +1027,12 @@ class RequestDetailsController {
     }
   }
 
-  Future<TravelRequestModel> enhanceRequestWithRoadMetrics(TravelRequestModel current) async {
-    final pointsRaw = await _hiveDb.getRoutePointsForRequest(current.requestId);
-    var allPoints = pointsRaw.map((e) => RoutePointModel.fromMap(e)).toList();
-
-    if (allPoints.isEmpty && current.routePoints.isNotEmpty) {
-      allPoints = current.routePoints.map((e) => RoutePointModel.fromMap(e)).toList();
+  Future<TravelRequestModel> enhanceRequestWithRoadMetrics(
+      TravelRequestModel current) async {
+    if (!ServiceLocator.I.has<TripRoadMetricsService>()) {
+      return current.sanitizeAbsurdOfficialDistances().withRecalculatedSummary();
     }
-
-    if (allPoints.isEmpty && current.restResourceId.isNotEmpty && isOnline.value) {
-      try {
-        final res = await _travelApi.listRoutePoints(current.restResourceId);
-        if (res case ApiSuccess(:final data)) {
-          allPoints = data.map((d) => RoutePointModel.fromMap(d)).toList();
-        }
-      } catch (_) {}
-    }
-
-    final distanceService = DistanceService();
-    var updatedLegs = <TripLegModel>[];
-    var changed = false;
-
-    for (final leg in current.tripLegs) {
-      if (leg.departurePunch != null && leg.arrivalPunch != null) {
-        final start = leg.departurePunch!.time.toUtc();
-        final end = leg.arrivalPunch!.time.toUtc();
-        final legPoints = allPoints.where((p) {
-          if (p.legId == leg.legId) return true;
-          final t = p.timestamp.toUtc();
-          return !t.isBefore(start) && !t.isAfter(end);
-        }).toList()..sort((a, b) => a.timestamp.compareTo(b.timestamp));
-
-        if (legPoints.length >= 2) {
-          legPoints.sort((a, b) => a.timestamp.compareTo(b.timestamp));
-
-          final filledLegPoints = <RoutePointModel>[];
-          filledLegPoints.add(legPoints.first);
-
-          for (int i = 1; i < legPoints.length; i++) {
-            final prev = legPoints[i - 1];
-            final next = legPoints[i];
-
-            final timeDiff = next.timestamp.difference(prev.timestamp);
-            if (timeDiff > const Duration(minutes: 5) &&
-              GoogleMapsConfig.isConfigured) {
-              final directDist = GeoUtils.distanceMeters(
-                prev.latitude, prev.longitude,
-                next.latitude, next.longitude,
-              );
-              // Cap gap-fill so teleports after app-kill cannot invent thousands of km.
-              if (directDist > 150 && directDist <= 2500) {
-                try {
-                  final routes = await distanceService.fetchDrivingRoutesWithAlternatives(
-                    originLatitude: prev.latitude,
-                    originLongitude: prev.longitude,
-                    destinationLatitude: next.latitude,
-                    destinationLongitude: next.longitude,
-                  );
-                  if (routes.isNotEmpty) {
-                    final routePoints = routes.first.polylinePoints;
-                    final stepTime = timeDiff.inMilliseconds ~/ (routePoints.length + 1);
-
-                    for (int j = 1; j < routePoints.length - 1; j++) {
-                      final pt = routePoints[j];
-                      final interpolatedTime = prev.timestamp.add(Duration(milliseconds: stepTime * j));
-                      filledLegPoints.add(RoutePointModel(
-                        pointId: 'gap_${prev.pointId}_$j',
-                        requestId: prev.requestId,
-                        legId: leg.legId,
-                        sessionId: prev.sessionId,
-                        timestamp: interpolatedTime,
-                        latitude: pt.latitude,
-                        longitude: pt.longitude,
-                        accuracy: 10.0,
-                        speed: 0.0,
-                        heading: 0.0,
-                        altitude: 0.0,
-                        isMoving: true,
-                        isStopMarker: false,
-                        source: 'google_gap_filler',
-                        isSynced: false,
-                      ));
-                    }
-                  }
-                } catch (_) {}
-              }
-            }
-            filledLegPoints.add(next);
-          }
-
-          final normalizedPoints = filledLegPoints.map<RoutePointModel>((p) => RoutePointModel(
-            pointId: p.pointId,
-            requestId: p.requestId,
-            legId: leg.legId,
-            sessionId: p.sessionId,
-            timestamp: p.timestamp,
-            latitude: p.latitude,
-            longitude: p.longitude,
-            accuracy: p.accuracy,
-            speed: p.speed,
-            heading: p.heading,
-            altitude: p.altitude,
-            isMoving: p.isMoving,
-            isStopMarker: p.isStopMarker,
-            source: p.source,
-            isSynced: p.isSynced,
-          )).toList();
-
-          final legMetrics = TrackAnalytics.computeLegMetrics(
-            points: normalizedPoints,
-            legId: leg.legId,
-            startInclusive: start,
-            endInclusive: end,
-            vehicleType: current.vehicleType,
-          );
-
-          if (legMetrics.distanceKm > 0 && legMetrics.polylineEncoded.isNotEmpty) {
-            final actualDistance = legMetrics.distanceKm;
-            final encodedPolyline = legMetrics.polylineEncoded;
-
-            if (leg.actualDistanceKmFromTrack != actualDistance ||
-                leg.routePolylineEncoded != encodedPolyline) {
-              updatedLegs.add(leg.copyWith(
-                actualDistanceKmFromTrack: actualDistance,
-                provisionalDistanceKm: actualDistance,
-                routePolylineEncoded: encodedPolyline,
-                trackMovingDurationMinutes: legMetrics.movingMinutes,
-                trackStoppedDurationMinutes: legMetrics.stoppedMinutes,
-              ));
-              changed = true;
-              continue;
-            } else {
-              updatedLegs.add(leg);
-              continue;
-            }
-          }
-        }
-
-        final needsMetrics = leg.actualDistanceKmFromTrack == null ||
-            leg.routePolylineEncoded == null ||
-            leg.routePolylineEncoded!.isEmpty;
-
-        if (needsMetrics && GoogleMapsConfig.isConfigured) {
-          try {
-            final routes = await distanceService.fetchDrivingRoutesWithAlternatives(
-              originLatitude: leg.departurePunch!.latitude,
-              originLongitude: leg.departurePunch!.longitude,
-              destinationLatitude: leg.arrivalPunch!.latitude,
-              destinationLongitude: leg.arrivalPunch!.longitude,
-            );
-
-            if (routes.isNotEmpty) {
-              final bestRoute = routes.first;
-              final roadDistance = bestRoute.distanceKm;
-              final points = bestRoute.polylinePoints;
-              final encodedPolyline = points.map((p) => '${p.latitude},${p.longitude}').join('|');
-
-              updatedLegs.add(leg.copyWith(
-                actualDistanceKmFromTrack: roadDistance,
-                routePolylineEncoded: encodedPolyline,
-              ));
-              changed = true;
-              continue;
-            }
-          } catch (e) {
-          }
-        }
-      }
-      updatedLegs.add(leg);
-    }
-
-    if (changed) {
-      final updated = current.copyWith(tripLegs: updatedLegs).withRecalculatedSummary();
-      // Asynchronously update server and database
-      unawaited(_syncEnhancedMetricsToApi(updated));
-      return updated;
-    }
-    return current;
-  }
-
-  Future<void> _syncEnhancedMetricsToApi(TravelRequestModel updated) async {
-    try {
-      final pathId = updated.restResourceId;
-      final legMaps = updated.tripLegs.map((l) => l.toMap()).toList();
-      await _travelApi.update(pathId, {
-        'tripLegs': legMaps,
-        'totalDistanceKm': updated.totalDistanceKm,
-        'updatedAt': DateTime.now().toIso8601String(),
-      });
-      // Save updated request to Hive database
-      await _hiveDb.saveTravelRequest(updated.toMap());
-    } catch (e) {
-    }
+    return ServiceLocator.I.get<TripRoadMetricsService>().enhance(current);
   }
 
   String? _nextPunchType(TripLegModel leg) {

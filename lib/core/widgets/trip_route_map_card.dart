@@ -1,11 +1,9 @@
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 
 import '../constants/app_constants.dart';
-import '../layout/adaptive_layout.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text_styles.dart';
 import '../../modules/travel/data/models/travel_request_model.dart';
@@ -43,9 +41,9 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
   GoogleMapController? _mapController;
   bool _mapCreated = false;
 
-  Future<List<LatLng>>? _routePointsFuture;
+  Future<List<List<LatLng>>>? _routeSegmentsFuture;
   String _routePointsCacheKey = '';
-  List<LatLng>? _resolvedPoints;
+  List<List<LatLng>>? _resolvedSegments;
 
   String _routeDataKey(TravelRequestModel r) =>
       '${r.requestId}|${r.routePointCount}|${r.status}|'
@@ -59,36 +57,34 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
   }
 
   String _fullCacheKey() =>
-      '${_routeDataKey(widget.request)}|srv:${_adminServerKey(widget.adminServerPath)}';
+      '${_routeDataKey(widget.request)}|srv:${_adminServerKey(widget.adminServerPath)}|'
+      '${widget.request.routePoints.length}';
 
   bool get _isLiveServer =>
       widget.adminServerPath != null && widget.adminServerPath!.isNotEmpty;
 
-  String get _title => _isLiveServer ? 'Live GPS trail (server)' : 'Route traveled';
+  String get _title =>
+      _isLiveServer ? 'Live GPS trail (server)' : 'Route traveled';
 
-  List<LatLng> _displayPoints(List<LatLng> pts) =>
-      mapDisplayRoutePoints(pts);
+  List<LatLng> _flatten(List<List<LatLng>>? segs) {
+    if (segs == null) return const [];
+    return [for (final s in segs) ...s];
+  }
 
-  Future<List<LatLng>> _loadRoutePoints() =>
-      loadTraveledRoutePoints(widget.request);
+  List<LatLng> _displayPoints(List<LatLng> pts) => mapDisplayRoutePoints(pts);
 
   void _syncRouteLoad() {
     final key = _fullCacheKey();
     if (key == _routePointsCacheKey) return;
     _routePointsCacheKey = key;
 
-    final server = widget.adminServerPath;
-    if (server != null && server.isNotEmpty) {
-      _resolvedPoints = List<LatLng>.from(server);
-      _routePointsFuture = null;
-      return;
-    }
-
-    _resolvedPoints = null;
-    _routePointsFuture = _loadRoutePoints().then((pts) {
-      if (!mounted) return pts;
-      setState(() => _resolvedPoints = pts);
-      return pts;
+    // Gap-fill server/Hive points — never paint raw admin LatLng chords.
+    _resolvedSegments = null;
+    _routeSegmentsFuture =
+        loadTraveledRoutePointsFilled(widget.request).then((segs) {
+      if (!mounted) return segs;
+      setState(() => _resolvedSegments = segs);
+      return segs;
     });
   }
 
@@ -173,23 +169,32 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
     return tripMapStartTarget(widget.request);
   }
 
-  Widget _buildMapBody(List<LatLng>? pts, {bool isLoading = false}) {
-    final display = pts != null ? _displayPoints(pts) : <LatLng>[];
-    final center = display.isNotEmpty 
-        ? display.first 
+  Widget _buildMapBody(List<List<LatLng>>? segments, {bool isLoading = false}) {
+    final flattened = _flatten(segments);
+    final display =
+        flattened.isNotEmpty ? _displayPoints(flattened) : <LatLng>[];
+    final center = display.isNotEmpty
+        ? display.first
         : (_previewCenter() ?? const LatLng(20.5937, 78.9629));
 
-    final polyline = display.isNotEmpty
-        ? Polyline(
-            polylineId: const PolylineId('trip_route'),
-            points: display,
+    final polylines = <Polyline>{};
+    if (segments != null) {
+      for (var i = 0; i < segments.length; i++) {
+        final segDisplay = _displayPoints(segments[i]);
+        if (segDisplay.length < 2) continue;
+        polylines.add(
+          Polyline(
+            polylineId: PolylineId('trip_route_$i'),
+            points: segDisplay,
             color: AppColors.primary,
             width: 5,
             jointType: JointType.round,
             startCap: Cap.roundCap,
             endCap: Cap.roundCap,
-          )
-        : null;
+          ),
+        );
+      }
+    }
 
     final markers = <Marker>{
       if (display.isNotEmpty)
@@ -222,13 +227,13 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
                   target: center,
                   zoom: 13,
                 ),
-                polylines: polyline != null ? {polyline} : {},
+                polylines: polylines,
                 markers: markers,
                 onMapCreated: (controller) {
                   _mapController = controller;
                   _mapCreated = true;
                   WidgetsBinding.instance.addPostFrameCallback((_) {
-                    if (display.isNotEmpty) _fitCamera(pts!);
+                    if (flattened.isNotEmpty) _fitCamera(flattened);
                   });
                 },
                 myLocationButtonEnabled: false,
@@ -255,7 +260,8 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
                     child: Text(
                       'No GPS path to show yet. Path appears after travel legs are completed with live tracking.',
                       textAlign: TextAlign.center,
-                      style: AppTextStyles.bodySmall.copyWith(color: AppColors.white),
+                      style: AppTextStyles.bodySmall
+                          .copyWith(color: AppColors.white),
                     ),
                   ),
                 ),
@@ -266,8 +272,8 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
     );
   }
 
-  Widget _buildCard(List<LatLng>? pts, {bool isLoading = false}) {
-    final hasPath = pts != null && pts.isNotEmpty;
+  Widget _buildCard(List<List<LatLng>>? segments, {bool isLoading = false}) {
+    final hasPath = segments != null && segments.any((s) => s.length >= 2);
 
     return AppCard(
       type: AppCardType.elevatedCard,
@@ -276,7 +282,8 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
         children: [
           Row(
             children: [
-              const Icon(Icons.map_outlined, color: AppColors.primary, size: 22),
+              const Icon(Icons.map_outlined,
+                  color: AppColors.primary, size: 22),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
@@ -295,7 +302,7 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
             ],
           ),
           const SizedBox(height: AppConstants.defaultPadding),
-          _buildMapBody(pts, isLoading: isLoading),
+          _buildMapBody(segments, isLoading: isLoading),
         ],
       ),
     );
@@ -303,17 +310,12 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
 
   @override
   Widget build(BuildContext context) {
-    final server = widget.adminServerPath;
-    if (server != null && server.isNotEmpty) {
-      return _buildCard(server);
+    if (_resolvedSegments != null) {
+      return _buildCard(_resolvedSegments);
     }
 
-    if (_resolvedPoints != null) {
-      return _buildCard(_resolvedPoints);
-    }
-
-    return FutureBuilder<List<LatLng>>(
-      future: _routePointsFuture,
+    return FutureBuilder<List<List<LatLng>>>(
+      future: _routeSegmentsFuture,
       builder: (context, snapshot) {
         if (snapshot.hasError) {
           return AppCard(
@@ -329,8 +331,8 @@ class _TripRouteMapCardState extends State<TripRouteMapCard> {
           return _buildCard(null, isLoading: true);
         }
 
-        final pts = snapshot.data ?? [];
-        return _buildCard(pts.isEmpty ? null : pts);
+        final segs = snapshot.data ?? [];
+        return _buildCard(segs.isEmpty ? null : segs);
       },
     );
   }

@@ -58,6 +58,14 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
     return _authController.isHodOrAdmin || (curUser != null && curUser == reqUser);
   }
 
+  bool _isLiveStatus(TravelRequestModel trip) {
+    final s = trip.status;
+    return s == 'Travelling' ||
+        s == 'Returning' ||
+        s == 'At Client' ||
+        s == 'In Meeting';
+  }
+
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
@@ -78,10 +86,11 @@ class _UserRequestDetailsScreenState extends State<UserRequestDetailsScreen> {
           request: request,
           onBack: () => Navigator.of(context).maybePop(),
           useGoogleMaps: googleMapsSupported(),
-          adminServerPath:
-              _canViewServerTrail && _controller.adminLivePath.value.isNotEmpty
-                  ? List<LatLng>.from(_controller.adminLivePath.value)
-                  : null,
+          adminServerPath: _canViewServerTrail &&
+                  _isLiveStatus(request) &&
+                  _controller.adminLivePath.value.isNotEmpty
+              ? List<LatLng>.from(_controller.adminLivePath.value)
+              : null,
           sheetFooter: (context) => AnimatedBuilder(
                 animation: Listenable.merge([
                   _controller.request,

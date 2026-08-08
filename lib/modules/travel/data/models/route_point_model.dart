@@ -96,14 +96,36 @@ class RoutePointModel {
 
   static DateTime _parseTime(dynamic v) {
     if (v == null) return DateTime.now();
+    if (v is DateTime) return v;
+    if (v is int || v is double) {
+      final n = (v as num).toDouble();
+      if (n > 1e12) {
+        return DateTime.fromMillisecondsSinceEpoch(n.round(), isUtc: true);
+      }
+      if (n > 1e9) {
+        return DateTime.fromMillisecondsSinceEpoch(
+          (n * 1000).round(),
+          isUtc: true,
+        );
+      }
+      return DateTime.now();
+    }
     if (v is String) {
+      final s = v.trim();
+      if (s.isEmpty) return DateTime.now();
+      final asNum = double.tryParse(s);
+      if (asNum != null &&
+          s.length >= 10 &&
+          !s.contains('-') &&
+          !s.contains('T')) {
+        return _parseTime(asNum);
+      }
       try {
-        return DateTime.parse(v);
+        return DateTime.parse(s);
       } catch (_) {
         return DateTime.now();
       }
     }
-    if (v is DateTime) return v;
     return DateTime.now();
   }
 

@@ -20,20 +20,18 @@ bool isTravelRequestRunning(TravelRequestModel request) {
   return runningStatuses.contains(request.status);
 }
 
-const bool bypassActiveTripCheck = false; // Temporary testing flag
-
-/// Blocks creating a new request while another trip is in progress.
-bool blocksNewTravelRequest(TravelRequestModel? activeTrip) {
-  if (bypassActiveTripCheck) return false;
-  if (activeTrip == null) return false;
-  return isTravelRequestRunning(activeTrip);
-}
+/// Users may create / hold multiple trips at once.
+///
+/// GPS still tracks only the trip the user has punched departure on
+/// ([BackgroundLocationService] focus). Creating another trip is allowed.
+bool blocksNewTravelRequest(TravelRequestModel? activeTrip) => false;
 
 String newTravelRequestBlockedMessage(TravelRequestModel trip) {
   final label = trip.clientName.isNotEmpty
       ? trip.clientName
       : trip.displayToLocation;
-  return 'Complete your current trip ($label) before creating a new one.';
+  return 'You already have an in-progress trip ($label). '
+      'You can still create another — GPS tracks the trip you start.';
 }
 
 /// Whether the active leg can be edited (not departed, not return leg).

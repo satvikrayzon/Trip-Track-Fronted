@@ -215,21 +215,33 @@ class SyncService {
       var anyFailure = false;
       for (final entry in byRequest.entries) {
         final result = await api.postRoutePointsBatch(entry.key, entry.value);
-        if (result.isSuccess) {
-          matchedRequestIds.add(entry.key);
-          for (final p in entry.value) {
-            final id = p['pointId'] as String?;
-            if (id != null) syncedIds.add(id);
-          }
-        } else {
-          anyFailure = true;
+        switch (result) {
+          case ApiSuccess(:final data):
+            matchedRequestIds.add(entry.key);
+            final accepted = data['acceptedClientPointIds'];
+            if (accepted is List && accepted.isNotEmpty) {
+              for (final id in accepted) {
+                final s = id?.toString();
+                if (s != null && s.isNotEmpty) syncedIds.add(s);
+              }
+            } else {
+              // Older servers: only mark synced if inserted matches batch size.
+              final inserted = (data['inserted'] as num?)?.toInt() ?? 0;
+              if (inserted >= entry.value.length) {
+                for (final p in entry.value) {
+                  final id = p['pointId']?.toString();
+                  if (id != null) syncedIds.add(id);
+                }
+              }
+            }
+          case ApiFailure():
+            anyFailure = true;
         }
       }
 
       if (syncedIds.isNotEmpty) {
         await _db.markRoutePointsSynced(syncedIds);
         await _updatePendingCount();
-        // After offline catch-up, ask Nest to rematch official route/km.
         if (ServiceLocator.I.has<MapMatchingService>()) {
           final matcher = ServiceLocator.I.get<MapMatchingService>();
           for (final requestId in matchedRequestIds) {

@@ -31,7 +31,6 @@ class _UserCreateRequestScreenState extends State<UserCreateRequestScreen> {
   late final TextEditingController _clientNameController;
   late final TextEditingController _purposeController;
   bool _isEditMode = false;
-  bool _checkedCreateGuard = false;
 
   @override
   void initState() {
@@ -83,22 +82,6 @@ class _UserCreateRequestScreenState extends State<UserCreateRequestScreen> {
       return;
     }
 
-    WidgetsBinding.instance.addPostFrameCallback((_) => _guardCreateIfNeeded());
-  }
-
-  Future<void> _guardCreateIfNeeded() async {
-    if (_checkedCreateGuard || _isEditMode || !mounted) return;
-    _checkedCreateGuard = true;
-
-    final blocking = await _controller.findBlockingActiveTrip();
-    if (!mounted || blocking == null) return;
-
-    showAppSnackBar(
-      title: 'Trip In Progress',
-      message: newTravelRequestBlockedMessage(blocking),
-      backgroundColor: AppColors.warning,
-    );
-    Navigator.of(context).pop();
   }
 
   @override

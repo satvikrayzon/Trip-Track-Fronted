@@ -6,6 +6,7 @@ import '../../../../core/database/hive_database.dart';
 import '../../../../core/di/service_locator.dart';
 import '../../../../core/network/failures/network_failure.dart';
 import '../../../../core/network/models/api_result.dart';
+import '../../../../core/services/trip_road_metrics_service.dart';
 import '../../../../core/utils/app_debug_log.dart';
 import '../../../../features/tracking/data/services/trip_realtime_binder.dart';
 import '../../../auth/presentation/controllers/app_auth_controller.dart';
@@ -161,6 +162,16 @@ class UserRequestsController {
           }
 
           _allMine.sort((a, b) => b.requestDate.compareTo(a.requestDate));
+
+          if (ServiceLocator.I.has<TripRoadMetricsService>()) {
+            _allMine = await ServiceLocator.I
+                .get<TripRoadMetricsService>()
+                .enhanceAll(_allMine);
+            if (reset && _allMine.isNotEmpty) {
+              await _syncHiveWithServer(userId, _allMine);
+            }
+          }
+
           hasMore.value = data.hasMore;
           if (data.hasMore) _page++;
           _applyFilters();

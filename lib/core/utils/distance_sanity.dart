@@ -42,6 +42,8 @@ class DistanceSanity {
   }
 
   /// Prefer sane official, else GPS / planned / punch distance.
+  /// When GPS track exists and official is meaningfully higher, prefer GPS —
+  /// Nest match often inflated card km until detail route reload.
   static double? selectLegKm({
     double? officialKm,
     double? provisionalKm,
@@ -51,6 +53,22 @@ class DistanceSanity {
     int? travelMinutes,
   }) {
     final gps = provisionalKm ?? trackKm;
+    if (gps != null && gps > 0.05) {
+      if (officialKm != null &&
+          officialKm > 0 &&
+          !isOfficialAbsurd(
+            officialKm: officialKm,
+            gpsKm: gps,
+            plannedKm: plannedKm,
+            travelMinutes: travelMinutes,
+          )) {
+        // Official only when close to GPS; otherwise cards show inflated km.
+        if (officialKm <= gps * 1.25 || officialKm - gps <= 0.5) {
+          return officialKm;
+        }
+      }
+      return gps;
+    }
     if (officialKm != null &&
         officialKm > 0 &&
         !isOfficialAbsurd(
@@ -61,7 +79,6 @@ class DistanceSanity {
         )) {
       return officialKm;
     }
-    if (gps != null && gps > 0) return gps;
     if (plannedKm != null && plannedKm > 0) return plannedKm;
     if (punchKm != null && punchKm > 0) return punchKm;
     return null;

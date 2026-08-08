@@ -101,9 +101,10 @@ class _EnterpriseTripDetailPageState
           request: trip,
           onBack: () => context.pop(),
           useGoogleMaps: _useGoogleMaps(),
-          adminServerPath: controller.adminLivePath.value.isEmpty
-              ? null
-              : List<LatLng>.from(controller.adminLivePath.value),
+          adminServerPath: _isLiveStatus(trip) &&
+                  controller.adminLivePath.value.isNotEmpty
+              ? List<LatLng>.from(controller.adminLivePath.value)
+              : null,
           sheetFooter: !_isAdmin() && controller.primaryActionLabel.isNotEmpty
               ? (context) => ValueListenableBuilder<bool>(
                     valueListenable: controller.isPunching,
@@ -162,6 +163,14 @@ class _EnterpriseTripDetailPageState
 
   bool _isAdmin() =>
       ref.read(authControllerProvider).currentUserData?.role == 'admin';
+
+  bool _isLiveStatus(TravelRequestModel trip) {
+    final s = trip.status;
+    return s == 'Travelling' ||
+        s == 'Returning' ||
+        s == 'At Client' ||
+        s == 'In Meeting';
+  }
 
   bool _useGoogleMaps() => googleMapsSupported();
 
