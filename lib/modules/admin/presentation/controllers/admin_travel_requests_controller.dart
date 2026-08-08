@@ -319,7 +319,6 @@ class AdminTravelRequestsController {
       }).toList();
       _applyFilters();
     } catch (e) {
-      debugPrint('AdminTravelRequests: enhanceMetrics failed: $e');
     }
   }
 

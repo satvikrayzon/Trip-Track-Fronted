@@ -384,7 +384,6 @@ class TrackAnalytics {
   /// ];
   /// final config = GpsTrackingConfig.car();
   /// final result = TrackAnalytics.calculateRouteDistance(points: points, config: config);
-  /// print("Distance: ${result.distanceKm} km");
   /// ```
   static RouteDistanceResult calculateRouteDistance({
     required List<GpsPoint> points,

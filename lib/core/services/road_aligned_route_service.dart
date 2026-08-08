@@ -5,11 +5,7 @@ import '../utils/route_point_simplify.dart';
 import 'distance_service.dart';
 import 'gps_gap_road_fill.dart';
 
-void _roadAlignLog(String message) {
-  // Use print so logs show in --release (debugPrint is often silenced).
-  // ignore: avoid_print
-  print('[ROAD_ALIGN] $message');
-}
+
 
 /// Result of merging GPS samples with Google road geometry.
 class RoadAlignedRoute {
@@ -57,13 +53,8 @@ class RoadAlignedRouteService {
     LatLng? anchorStart,
     LatLng? anchorEnd,
   }) async {
-    _roadAlignLog(
-      'align() START build=v8-punch-anchor gps=${gpsPoints.length} '
-      'startAnchor=${anchorStart != null} endAnchor=${anchorEnd != null}',
-    );
 
     if (gpsPoints.length < 2) {
-      _roadAlignLog('align() ABORT: need ≥2 GPS points');
       return RoadAlignedRoute(
         points: gpsPoints.map((p) => LatLng(p.lat, p.lng)).toList(),
         distanceKm: 0,
@@ -93,13 +84,8 @@ class RoadAlignedRouteService {
       if (d < 22) continue;
       spaced.add(p);
     }
-    _roadAlignLog(
-      'align() cleaned ${gpsPoints.length} → ${cleaned.length} → '
-      'spaced ${spaced.length}',
-    );
 
     if (spaced.length < 2) {
-      _roadAlignLog('align() FALLBACK gps_only (too few after clean)');
       return RoadAlignedRoute(
         points: cleaned.map((p) => LatLng(p.lat, p.lng)).toList(),
         distanceKm: _pathKm(cleaned.map((p) => LatLng(p.lat, p.lng)).toList()),
@@ -123,11 +109,6 @@ class RoadAlignedRouteService {
             gapsFilled: local.gapsFilled,
           )
         : local;
-    _roadAlignLog(
-      'align() DONE engine=${result.engine} '
-      'pts=${result.points.length} km=${result.distanceKm.toStringAsFixed(2)} '
-      'gaps=${result.gapsFilled}',
-    );
     return result;
   }
 
@@ -187,10 +168,6 @@ class RoadAlignedRouteService {
     );
     if (d0 <= nearMeters) return points;
 
-    _roadAlignLog(
-      'trimGpsLeading: drop $firstNear pts before punch '
-      '(first was ${d0.toStringAsFixed(0)}m away)',
-    );
     final anchorPt = GpsGapInputPoint(
       lat: anchor.latitude,
       lng: anchor.longitude,
@@ -366,11 +343,6 @@ class RoadAlignedRouteService {
 
       if (bestI == null || bestJ == null || bestJ <= bestI + 1) break;
 
-      _roadAlignLog(
-        'stripDetourLoops: remove ${bestJ - bestI - 1} pts '
-        '(${bestPath.toStringAsFixed(0)}m loop, return chord '
-        '${GeoUtils.distanceMeters(work[bestI].latitude, work[bestI].longitude, work[bestJ].latitude, work[bestJ].longitude).toStringAsFixed(0)}m)',
-      );
 
       final next = <LatLng>[
         ...work.sublist(0, bestI + 1),
@@ -491,7 +463,6 @@ class RoadAlignedRouteService {
   }
 
   Future<RoadAlignedRoute> _alignLocally(List<GpsGapInputPoint> points) async {
-    _roadAlignLog('local: kill-gap Directions…');
     // forDisplay: fill large hops even when timestamps were lost after sync.
     final filled = await GpsGapRoadFill.fillPoints(
       points: points,
@@ -506,10 +477,6 @@ class RoadAlignedRouteService {
     // those B→C hops so kill/reopen never leaves a blank map hole.
     joined = await _stitchLongEdges(joined);
     var gapsFilled = filled.gapsFilled;
-    _roadAlignLog(
-      'local: after kill-gap+stitch pts=${joined.length} '
-      'gapsFilled=$gapsFilled',
-    );
     if (joined.length < 2) {
       return RoadAlignedRoute(
         points: points.map((p) => LatLng(p.lat, p.lng)).toList(),
@@ -518,11 +485,9 @@ class RoadAlignedRouteService {
       );
     }
 
-    _roadAlignLog('local: Snap-to-Roads…');
     final snapped = await _distance.snapPathToRoads(joined);
     if (snapped.length >= 2 && _isSane(joined, snapped)) {
       final stitched = await _stitchLongEdges(snapped);
-      _roadAlignLog('local Snap OK ${joined.length} → ${stitched.length}');
       return RoadAlignedRoute(
         points: stitched,
         distanceKm: _pathKm(stitched),
@@ -532,18 +497,10 @@ class RoadAlignedRouteService {
         gapsFilled: gapsFilled,
       );
     }
-    _roadAlignLog(
-      'local Snap FAIL/unsane snapped=${snapped.length} '
-      '→ Directions corridor…',
-    );
 
     final corridor = await _directionsCorridorAlongGps(joined);
     if (corridor.points.length >= 2 && _isSane(joined, corridor.points)) {
       final stitched = await _stitchLongEdges(corridor.points);
-      _roadAlignLog(
-        'local corridor OK segs=${corridor.segments} '
-        'pts=${stitched.length}',
-      );
       return RoadAlignedRoute(
         points: stitched,
         distanceKm: _pathKm(stitched),
@@ -553,7 +510,6 @@ class RoadAlignedRouteService {
         gapsFilled: gapsFilled,
       );
     }
-    _roadAlignLog('local corridor FAIL → stitch remaining long edges');
 
     final fallback = await _stitchLongEdges(joined);
     final stitchedExtra = _countLongEdges(joined) - _countLongEdges(fallback);
@@ -613,22 +569,13 @@ class RoadAlignedRouteService {
       if (route != null && route.polylinePoints.length >= 2) {
         out.addAll(route.polylinePoints.skip(1));
         stitches++;
-        _roadAlignLog(
-          'stitch OK ${straight.toStringAsFixed(0)}m → '
-          '${(route.distanceKm * 1000).toStringAsFixed(0)}m road',
-        );
       } else {
         // Never paint a false river/building chord — leave hop for edge break.
         out.add(b);
-        _roadAlignLog(
-          'stitch FAIL ${straight.toStringAsFixed(0)}m '
-          '(routes=${routes.length}) — chord will be broken on paint',
-        );
       }
     }
 
     if (stitches > 0) {
-      _roadAlignLog('stitch done: $stitches long edge(s) filled');
     }
     return out;
   }

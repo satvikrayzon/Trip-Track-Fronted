@@ -15,8 +15,6 @@ import '../../../../core/services/punch_reminder_service.dart';
 import '../../../../core/services/tracking_session_service.dart';
 import '../../../../core/services/trip_road_metrics_service.dart';
 
-import '../../../../core/utils/travel_request_debug_log.dart';
-
 import '../../../auth/presentation/controllers/app_auth_controller.dart';
 
 import '../../../travel/data/datasources/travel_request_remote_datasource.dart';
@@ -205,12 +203,6 @@ class UserHomeController {
 
           final merged = _mergeWithCache(parsed, hiveById);
 
-          TravelRequestDebugLog.logParsedComparison(
-            source: 'UserHome',
-            raw: m,
-            parsed: parsed,
-            afterMerge: merged,
-          );
 
           requests.add(merged);
         }

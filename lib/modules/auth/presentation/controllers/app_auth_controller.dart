@@ -202,8 +202,7 @@ class AppAuthController {
         await _handleUnauthorizedProfileLoad(allowRetry: !isRetry);
       } else if (!silent && !failure.isTransientNetworkError) {
         errorMessage.value = failure.message;
-      } else if (kDebugMode && failure.isTransientNetworkError) {
-      }
+      } else 
       return;
     }
     if (result case ApiSuccess(:final data)) {
@@ -289,8 +288,6 @@ class AppAuthController {
       }
     } catch (e, st) {
       errorMessage.value = e.toString();
-      if (kDebugMode) {
-      }
     } finally {
       isLoading.value = false;
     }

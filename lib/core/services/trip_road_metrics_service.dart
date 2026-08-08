@@ -361,7 +361,6 @@ class TripRoadMetricsService {
         );
       }
     } catch (e) {
-      debugPrint('TripRoadMetricsService: gap-filler persist failed: $e');
     }
   }
 
@@ -371,10 +370,6 @@ class TripRoadMetricsService {
       final api = _api;
       final id = updated.restResourceId;
       if (api == null || id.isEmpty) {
-        debugPrint(
-          'TripRoadMetricsService: persist skipped '
-          '(api=${api != null} id="$id")',
-        );
         return;
       }
 
@@ -403,26 +398,12 @@ class TripRoadMetricsService {
 
       var result = await api.update(id, patch);
       if (result is ApiFailure) {
-        debugPrint(
-          'TripRoadMetricsService: update() failed, retry patchTravelRequest: '
-          '${result.failureOrNull?.message}',
-        );
         final retry = await api.patchTravelRequest(id, patch);
         if (retry is ApiFailure) {
-          debugPrint(
-            'TripRoadMetricsService: PATCH km FAILED id=$id '
-            'km=${updated.totalDistanceKm.toStringAsFixed(2)} '
-            'err=${retry.failureOrNull?.message}',
-          );
           return;
         }
       }
-      debugPrint(
-        'TripRoadMetricsService: PATCH km OK id=$id '
-        'km=${updated.totalDistanceKm.toStringAsFixed(2)}',
-      );
     } catch (e) {
-      debugPrint('TripRoadMetricsService: persist exception: $e');
     }
   }
 }

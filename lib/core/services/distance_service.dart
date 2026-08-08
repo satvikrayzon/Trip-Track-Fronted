@@ -1,6 +1,5 @@
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:http/http.dart' as http;
 
@@ -52,14 +51,6 @@ class DistanceService {
       sparse,
       interpolate: interpolate,
     );
-    if (viaDirect.length >= 2) {
-      debugPrint(
-        'DistanceService: Snap-to-Roads OK '
-        '(${sparse.length} → ${viaDirect.length})',
-      );
-    } else {
-      debugPrint('DistanceService: Snap-to-Roads unavailable');
-    }
     return viaDirect;
   }
 
@@ -85,15 +76,10 @@ class DistanceService {
         final response =
             await http.get(uri).timeout(const Duration(seconds: 20));
         if (response.statusCode != 200) {
-          debugPrint(
-            'DistanceService: Google snap HTTP ${response.statusCode} '
-            'body=${response.body.length > 200 ? response.body.substring(0, 200) : response.body}',
-          );
           return const [];
         }
         final body = jsonDecode(response.body) as Map<String, dynamic>;
         if (body['error'] != null) {
-          debugPrint('DistanceService: Google snap error=${body['error']}');
           return const [];
         }
         final snapped = body['snappedPoints'];
@@ -108,7 +94,6 @@ class DistanceService {
           out.add(LatLng(lat, lng));
         }
       } catch (e) {
-        debugPrint('DistanceService: Google snap direct failed: $e');
         return const [];
       }
     }
@@ -181,8 +166,6 @@ class DistanceService {
 
       final body = jsonDecode(response.body) as Map<String, dynamic>;
       if (body['status'] != 'OK') {
-        debugPrint(
-            'DistanceService: Google Directions status=${body['status']}');
         return [];
       }
 
@@ -228,7 +211,6 @@ class DistanceService {
       }
       return out;
     } catch (e) {
-      debugPrint('DistanceService: Google Directions direct failed: $e');
       return [];
     }
   }

@@ -223,10 +223,6 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
   TravelRequestModel request,
 ) async {
   // ignore: avoid_print
-  print(
-    '[ROAD_ALIGN] loadWholeTripPathFilled START '
-    'id=${request.requestId} status=${request.status} build=v8-local-cache',
-  );
 
   if (!_isLiveTrackingStatus(request.status)) {
     final cached = await _loadAlignedPaintCache(request);
@@ -238,7 +234,6 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
       ];
       if (flat.isNotEmpty) {
         // ignore: avoid_print
-        print('[ROAD_ALIGN] whole-path CACHE HIT segs=${flat.length}');
         return flat;
       }
     }
@@ -246,12 +241,8 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
 
   final pointsWithTime = await _loadRoutePointsWithTime(request);
   // ignore: avoid_print
-  print(
-    '[ROAD_ALIGN] loaded raw GPS samples=${pointsWithTime.length}',
-  );
   if (pointsWithTime.length < 2) {
     // ignore: avoid_print
-    print('[ROAD_ALIGN] ABORT: <2 GPS samples — nothing to paint');
     return const [];
   }
 
@@ -290,10 +281,8 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
     input.add(next);
   }
   // ignore: avoid_print
-  print('[ROAD_ALIGN] after 15m dedupe input=${input.length}');
   if (input.length < 2) {
     // ignore: avoid_print
-    print('[ROAD_ALIGN] ABORT: <2 after dedupe');
     return const [];
   }
 
@@ -305,17 +294,11 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
   if (!aligned.isEmpty) {
     final pieces = RoadAlignedRouteService().toMapPieces(aligned);
     // ignore: avoid_print
-    print(
-      '[ROAD_ALIGN] PAINT engine=${aligned.engine} '
-      'alignedPts=${aligned.points.length} pieces=${pieces.length} '
-      'km=${aligned.distanceKm.toStringAsFixed(2)}',
-    );
     await _saveAlignedPaintCache(request, [pieces]);
     return pieces;
   }
 
   // ignore: avoid_print
-  print('[ROAD_ALIGN] align empty → trying matched-route fallback');
   final matched = await loadMatchedRouteSegments(request);
   final matchedPts = <LatLng>[];
   for (final seg in matched) {
@@ -323,13 +306,9 @@ Future<List<List<LatLng>>> loadWholeTripPathFilled(
   }
   if (matchedPts.length >= 2) {
     // ignore: avoid_print
-    print(
-      '[ROAD_ALIGN] PAINT matched-route fallback pts=${matchedPts.length}',
-    );
     return _piecesFromPath(matchedPts);
   }
   // ignore: avoid_print
-  print('[ROAD_ALIGN] PAINT nothing — empty path');
   return const [];
 }
 
@@ -493,11 +472,6 @@ Future<
       .toList();
 
   // ignore: avoid_print
-  print(
-    '[ROAD_ALIGN] route samples localFirst=${allPointsMap.length} '
-    'afterDedupe=${normalized.length} live=$isLive '
-    'needsServer=$needsServer',
-  );
 
   return _dedupeRouteSamples(normalized);
 }
@@ -628,10 +602,6 @@ Future<List<List<List<LatLng>>>> loadTraveledLegPoints(
     final cached = await _loadAlignedPaintCache(request);
     if (cached != null) {
       // ignore: avoid_print
-      print(
-        '[ROAD_ALIGN] paint CACHE HIT legs=${cached.length} '
-        'id=${request.requestId}',
-      );
       return cached;
     }
   }

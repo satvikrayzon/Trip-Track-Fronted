@@ -52,14 +52,5 @@ abstract final class ApiEndpoints {
   static String travelRequestMatch(String requestId) =>
       '$travelRequests/$requestId/match';
 
-  /// Legacy Nest Directions proxy (unused — Flutter calls Google directly).
-  static const String directionsRoute = '/directions/route';
-
-  /// Legacy Nest Snap-to-Roads proxy (unused — Flutter calls Google directly).
-  static const String directionsSnapPath = '/directions/snap-path';
-
-  /// Legacy Nest align-path (unused — Flutter RoadAlignedRouteService is local).
-  static const String directionsAlignPath = '/directions/align-path';
-
   static const String adminFuelRates = '/admin/fuel-rates';
 }

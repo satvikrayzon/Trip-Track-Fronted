@@ -372,31 +372,19 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     final gen = ++_routeLoadGeneration;
     final loadFuture = () async {
       // ignore: avoid_print
-      print(
-        '[ROAD_ALIGN] map _syncRouteLoad '
-        'id=${widget.request.requestId} status=${widget.request.status} '
-        'completed=$isCompleted keepPrevious=$keepPrevious build=v5-leg-colors',
-      );
       // Prefer per-leg paths so Whole route paints distinct colors per leg.
       final legs = await loadTraveledLegPoints(widget.request);
       final hasLegPaint = legs.any((leg) => leg.any((s) => s.length >= 2));
       if (hasLegPaint) {
         // ignore: avoid_print
-        print(
-          '[ROAD_ALIGN] map using per-leg paths legs=${legs.length}',
-        );
         return legs;
       }
       final whole = await loadWholeTripPathFilled(widget.request);
       if (whole.isNotEmpty) {
         // ignore: avoid_print
-        print(
-          '[ROAD_ALIGN] map using whole path segs=${whole.length}',
-        );
         return [whole];
       }
       // ignore: avoid_print
-      print('[ROAD_ALIGN] map empty path');
       return <List<List<LatLng>>>[];
     }()
         .then((pts) {
@@ -412,10 +400,6 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
             if (seg.length >= 2) seg,
       ]);
       // ignore: avoid_print
-      print(
-        '[ROAD_ALIGN] map SETSTATE flatPts=${flat.length} '
-        'trackedKm=${trackedKm.toStringAsFixed(2)}',
-      );
       setState(() {
         _resolvedPoints = pts;
         _trackedPathKm = trackedKm > 0.05 ? trackedKm : null;

@@ -89,10 +89,6 @@ class ActiveTripRestoreService {
 
       case ApiFailure(:final failure):
 
-        if (kDebugMode && failure.statusCode != 404) {
-
-
-        }
 
         if (failure.statusCode == 404) {
 

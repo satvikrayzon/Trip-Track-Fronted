@@ -1,5 +1,4 @@
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart';
 
 import '../../../../core/api/api_endpoints.dart';
 import '../../../../core/constants/app_constants.dart';
@@ -7,8 +6,6 @@ import '../../../../core/network/api_call.dart';
 import '../../../../core/network/api_response_list.dart';
 import '../../../../core/network/failures/network_failure.dart';
 import '../../../../core/network/models/api_result.dart';
-import '../../../../core/utils/travel_request_debug_log.dart';
-import '../../../../core/utils/app_debug_log.dart';
 import '../models/route_segment_model.dart';
 import '../models/tracking_coverage_model.dart';
 import '../models/travel_request_list_result.dart';
@@ -45,23 +42,7 @@ class TravelRequestRemoteDataSource {
         page: page,
         limit: limit,
       );
-      TravelRequestDebugLog.logListResponse(
-        source: 'GET /travel-requests',
-        rawResponse: response.data,
-        items: parsed.items,
-        page: page,
-        limit: limit,
-      );
       return parsed;
-    }, logLabel: 'GET /travel-requests');
-  }
-
-  /// Legacy full list — avoid on home; prefer [listTravelRequests].
-  @Deprecated('Use listTravelRequests(page:, limit:)')
-  Future<ApiResult<List<Map<String, dynamic>>>> listTravelRequestsAll() {
-    return runApi(() async {
-      final response = await _dio.get(ApiEndpoints.travelRequests);
-      return ApiResponseList.parse(response.data);
     });
   }
 
@@ -73,7 +54,7 @@ class TravelRequestRemoteDataSource {
         throw const FormatException('Travel request response is not a JSON object');
       }
       return Map<String, dynamic>.from(data);
-    }, logLabel: 'GET /travel-requests/$requestId');
+    });
   }
 
   /// Current user's in-progress trip (`GET /travel-requests/active`). Null when none.
@@ -95,7 +76,7 @@ class TravelRequestRemoteDataSource {
       }
       if (data.isEmpty) return null;
       return Map<String, dynamic>.from(data);
-    }, logLabel: 'GET /travel-requests/active');
+    });
   }
 
   Future<ApiResult<Map<String, dynamic>>> create(
@@ -113,7 +94,7 @@ class TravelRequestRemoteDataSource {
         return Map<String, dynamic>.from(body);
       }
       throw const FormatException('Create travel request returned empty body');
-    }, logLabel: 'POST /travel-requests');
+    });
   }
 
   Future<ApiResult<Map<String, dynamic>>> createTravelRequest({
@@ -168,7 +149,7 @@ class TravelRequestRemoteDataSource {
         options: dioTimeoutOptions(_listTimeout),
       );
       return TravelRequestSummary.fromResponse(response.data);
-    }, logLabel: 'GET /travel-requests/summary');
+    });
   }
 
   /// Start departure — `POST /travel-requests/:id/departure`.
@@ -415,7 +396,7 @@ class TravelRequestRemoteDataSource {
         return Map<String, dynamic>.from(data);
       }
       throw const FormatException('Travel action returned empty body');
-    }, logLabel: 'POST $path');
+    });
   }
 
   Future<ApiResult<void>> update(
@@ -427,7 +408,7 @@ class TravelRequestRemoteDataSource {
         ApiEndpoints.travelRequest(requestId),
         data: patch,
       );
-    }, logLabel: 'PATCH /travel-requests/$requestId');
+    });
   }
 
   /// PATCH travel request and return updated body (for legacy-server fallbacks).
@@ -450,7 +431,7 @@ class TravelRequestRemoteDataSource {
         throw const FormatException('Travel request patch returned no body');
       }
       return Map<String, dynamic>.from(refetchData);
-    }, logLabel: 'PATCH /travel-requests/$requestId (with body)');
+    });
   }
 
   Future<ApiResult<void>> delete(String requestId) {
@@ -657,86 +638,6 @@ class TravelRequestRemoteDataSource {
       final data = response.data;
       if (data == null) return <String, dynamic>{};
       return Map<String, dynamic>.from(data as Map);
-    });
-  }
-
-  /// Nest Directions proxy — `POST /directions/route`.
-  ///
-  /// Returns route maps with `points` (list of `{lat,lng}`), `distanceKm`, etc.
-  Future<ApiResult<List<Map<String, dynamic>>>> fetchDrivingRoute({
-    required double originLatitude,
-    required double originLongitude,
-    required double destinationLatitude,
-    required double destinationLongitude,
-    bool alternatives = true,
-  }) {
-    return runApi(() async {
-      final response = await _dio.post(
-        ApiEndpoints.directionsRoute,
-        data: {
-          'origin': {
-            'lat': originLatitude,
-            'lng': originLongitude,
-          },
-          'destination': {
-            'lat': destinationLatitude,
-            'lng': destinationLongitude,
-          },
-          'alternatives': alternatives,
-        },
-        options: dioTimeoutOptions(const Duration(seconds: 15)),
-      );
-      final data = response.data;
-      if (data is! Map) return <Map<String, dynamic>>[];
-      final root = Map<String, dynamic>.from(data);
-      final routes = root['routes'];
-      if (routes is! List) return <Map<String, dynamic>>[];
-      return routes
-          .whereType<Map>()
-          .map((e) => Map<String, dynamic>.from(e))
-          .toList();
-    });
-  }
-
-  /// Nest Roads Snap-to-Roads proxy — `POST /directions/snap-path`.
-  Future<ApiResult<List<Map<String, dynamic>>>> snapPathToRoads({
-    required List<Map<String, double>> points,
-    bool interpolate = true,
-  }) {
-    return runApi(() async {
-      final response = await _dio.post(
-        ApiEndpoints.directionsSnapPath,
-        data: {
-          'points': points,
-          'interpolate': interpolate,
-        },
-        options: dioTimeoutOptions(const Duration(seconds: 20)),
-      );
-      final data = response.data;
-      if (data is! Map) return <Map<String, dynamic>>[];
-      final root = Map<String, dynamic>.from(data);
-      final list = root['points'];
-      if (list is! List) return <Map<String, dynamic>>[];
-      return list
-          .whereType<Map>()
-          .map((e) => Map<String, dynamic>.from(e))
-          .toList();
-    });
-  }
-
-  /// Nest GPS↔road merge — `POST /directions/align-path`.
-  Future<ApiResult<Map<String, dynamic>>> alignPathToRoads({
-    required List<Map<String, dynamic>> points,
-  }) {
-    return runApi(() async {
-      final response = await _dio.post(
-        ApiEndpoints.directionsAlignPath,
-        data: {'points': points},
-        options: dioTimeoutOptions(const Duration(seconds: 45)),
-      );
-      final data = response.data;
-      if (data is! Map) return <String, dynamic>{};
-      return Map<String, dynamic>.from(data);
     });
   }
 }

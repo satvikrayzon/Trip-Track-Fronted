@@ -110,7 +110,6 @@ class BackgroundLocationService {
         // Still track in foreground; background may be denied on some devices.
       }
     } catch (e) {
-      debugPrint('Background location mode enable failed: $e');
     }
 
     if (ServiceLocator.I.has<WebSocketTrackingService>()) {
@@ -123,7 +122,7 @@ class BackgroundLocationService {
     await _subscription?.cancel();
     _subscription = _location.onLocationChanged.listen(
       _onLocation,
-      onError: (e) => debugPrint('Location stream error: $e'),
+      onError: (_) {},
     );
   }
 
@@ -215,7 +214,6 @@ class BackgroundLocationService {
         return;
       }
     } catch (e) {
-      debugPrint('seedLastAcceptedFromHive failed: $e');
     }
   }
 
@@ -250,7 +248,6 @@ class BackgroundLocationService {
       if (gate.reason == 'hard_jump' || gate.reason == 'impossible_speed') {
         _kalmanFilter.reset();
       }
-      debugPrint('GPS rejected: ${gate.reason}');
       return;
     }
 
@@ -294,7 +291,6 @@ class BackgroundLocationService {
       );
       if (!postGate.accepted) {
         _kalmanFilter.reset();
-        debugPrint('GPS filtered rejected: ${postGate.reason}');
         return;
       }
     }
@@ -374,7 +370,6 @@ class BackgroundLocationService {
           cLng: filteredLng,
         )) {
       await HiveDatabase.instance.deleteRoutePoint(spikeMidId);
-      debugPrint('BackgroundLocationService: retracted GPS spike $spikeMidId');
       _prevAccepted = spikeAnchor;
       _prevEmitTime = _prevEmitTime;
       _prevPointId = _prevPointId;
@@ -406,11 +401,6 @@ class BackgroundLocationService {
         timeGap: timeDiff,
         straightLineMeters: dist,
       )) {
-        debugPrint(
-          'BackgroundLocationService: scheduling road fill '
-          '${dist.toStringAsFixed(0)}m / ${timeDiff.inSeconds}s'
-          '${isGapResume ? ' (gap_resume)' : ''}',
-        );
         unawaited(
           _persistRoadFillForGap(
             fromLat: gapFrom.latitude!,
@@ -474,9 +464,6 @@ class BackgroundLocationService {
       fromTime: fromTime,
       toTime: toTime,
     )) {
-      debugPrint(
-        'BackgroundLocationService: gap already has fillers — skip re-fill',
-      );
       return;
     }
 
@@ -515,10 +502,6 @@ class BackgroundLocationService {
       await HiveDatabase.instance.saveRoutePoint(point.toHiveMap());
     }
     pointsBuffered.value++;
-    debugPrint(
-      'BackgroundLocationService: persisted ${fill.midpoints.length} '
-      'gap-filler points (${fill.roadMeters.toStringAsFixed(0)}m road)',
-    );
 
     if (ServiceLocator.I.has<ConnectivityService>() &&
         ServiceLocator.I.get<ConnectivityService>().isConnected.value &&

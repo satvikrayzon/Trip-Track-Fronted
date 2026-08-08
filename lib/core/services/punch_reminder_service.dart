@@ -154,9 +154,6 @@ class PunchReminderService {
         await _evaluateArrival(trip, position);
       }
     } catch (e) {
-      if (kDebugMode) {
-        debugPrint('PunchReminderService.checkNow failed: $e');
-      }
     } finally {
       _tickRunning = false;
     }
@@ -351,9 +348,6 @@ class PunchReminderService {
         body: state.message,
       );
     } catch (e) {
-      if (kDebugMode) {
-        debugPrint('Punch reminder notification failed: $e');
-      }
     }
   }
 }

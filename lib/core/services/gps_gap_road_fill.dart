@@ -398,10 +398,6 @@ abstract final class GpsGapRoadFill {
           return b.value.length.compareTo(a.value.length);
         });
       out.addAll(_thinSpatial(ranked.first.value, minSeparationM: 25));
-      debugPrint(
-        'GpsGapRoadFill: collapsed ${run.length} fillers → '
-        '${ranked.first.value.length} (dropped ${groups.length - 1} extra generation(s))',
-      );
     }
     return out;
   }
@@ -499,15 +495,8 @@ abstract final class GpsGapRoadFill {
             forKillGap: isKill,
           );
           if (route == null && routes.isNotEmpty) {
-            debugPrint(
-              'GpsGapRoadFill[$policyVersion]: rejected '
-              '${routes.length} detour(s) for '
-              '${directDist.toStringAsFixed(0)}m hop '
-              '(best was ${(routes.first.distanceKm * 1000).toStringAsFixed(0)}m)',
-            );
           }
         } catch (e) {
-          debugPrint('GpsGapRoadFill[$policyVersion]: Directions error: $e');
         }
 
         if (route != null && route.polylinePoints.length >= 2) {
@@ -531,31 +520,15 @@ abstract final class GpsGapRoadFill {
           current.add(GpsGapOutputPoint.fromInput(next));
           roadFillMeters += route.distanceKm * 1000.0;
           gapsFilled++;
-          debugPrint(
-            'GpsGapRoadFill[$policyVersion]: filled '
-            '${directDist.toStringAsFixed(0)}m → '
-            '${(route.distanceKm * 1000).toStringAsFixed(0)}m road'
-            '${hasTimes ? ' (${timeDiff.inSeconds}s)' : ''}',
-          );
           continue;
         }
 
-        debugPrint(
-          'GpsGapRoadFill[$policyVersion]: Directions failed for '
-          '${directDist.toStringAsFixed(0)}m'
-          '${hasTimes ? ' / ${timeDiff.inSeconds}s' : ''} — breaking trail',
-        );
         breakTo(next);
         continue;
       }
 
       // Non-fillable but still a large hop: never paint a building-cutting chord.
       if (shouldBreakUnfilledChord(directDist)) {
-        debugPrint(
-          'GpsGapRoadFill: breaking unfilled chord '
-          '${directDist.toStringAsFixed(0)}m'
-          '${hasTimes ? ' / ${timeDiff.inSeconds}s' : ''}',
-        );
         breakTo(next);
         continue;
       }
@@ -792,19 +765,10 @@ abstract final class GpsGapRoadFill {
         destinationLongitude: toLng,
       );
       if (routes.isEmpty) {
-        debugPrint(
-          'GpsGapRoadFill: single gap Directions failed '
-          '(${directDist.toStringAsFixed(0)}m / ${timeDiff.inSeconds}s)',
-        );
         return null;
       }
       final route = pickSaneRoute(routes, directDist, forKillGap: true);
       if (route == null || route.polylinePoints.length < 2) {
-        debugPrint(
-          'GpsGapRoadFill: single gap rejected detour '
-          '(${directDist.toStringAsFixed(0)}m → '
-          '${(routes.first.distanceKm * 1000).toStringAsFixed(0)}m)',
-        );
         return null;
       }
       final mid = <GpsGapOutputPoint>[];
@@ -821,17 +785,12 @@ abstract final class GpsGapRoadFill {
           ),
         );
       }
-      debugPrint(
-        'GpsGapRoadFill: single gap filled '
-        '${directDist.toStringAsFixed(0)}m → ${(route.distanceKm * 1000).toStringAsFixed(0)}m',
-      );
       return GpsGapSingleFill(
         midpoints: mid,
         roadMeters: route.distanceKm * 1000.0,
         straightLineMeters: directDist,
       );
     } catch (e) {
-      debugPrint('GpsGapRoadFill: single gap error: $e');
       return null;
     }
   }

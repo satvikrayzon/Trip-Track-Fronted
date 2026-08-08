@@ -3,7 +3,6 @@ import 'package:flutter/foundation.dart';
 
 import 'failures/network_failure.dart';
 import 'models/api_result.dart';
-import '../utils/app_debug_log.dart';
 
 NetworkFailure _fromDio(DioException e) {
   final response = e.response;
@@ -64,24 +63,21 @@ Options dioTimeoutOptions(
 }
 
 /// Runs [runner] and maps [DioException] to [ApiFailure].
-/// When [logLabel] is set, logs details in debug mode (use for auth / debugging).
 Future<ApiResult<T>> runApi<T>(
   Future<T> Function() runner, {
   String? logLabel,
 }) async {
   try {
     final value = await runner();
-    if (kDebugMode && logLabel != null) {
-    }
     return ApiSuccess(value);
-  } on DioException catch (e, st) {
-    final failure = _fromDio(e);
-    return ApiFailure(failure);
-  } catch (e, st) {
-    final failure = NetworkFailure(
-      message: e.toString(),
-      raw: e,
+  } on DioException catch (e) {
+    return ApiFailure(_fromDio(e));
+  } catch (e) {
+    return ApiFailure(
+      NetworkFailure(
+        message: e.toString(),
+        raw: e,
+      ),
     );
-    return ApiFailure(failure);
   }
 }
