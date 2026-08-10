@@ -349,7 +349,6 @@ Future<
       ? request.requestId
       : request.restResourceId;
   final allPointsMap = <Map<String, dynamic>>[];
-  final isLive = _isLiveTrackingStatus(request.status);
 
   // 1) Memory cache
   final rawCached = _rawRoutePointsMemCache[requestId];
@@ -375,9 +374,9 @@ Future<
     } catch (_) {}
   }
 
-  // 3) Server refresh only when live, or when we have no local points.
-  final needsServer = isLive || allPointsMap.isEmpty;
-  if (needsServer &&
+  // 3) Server only when local trail is missing (offline-first).
+  // Live tips come from WS / polling after first paint — don't block map open.
+  if (allPointsMap.isEmpty &&
       ServiceLocator.I.has<TravelRequestRemoteDataSource>() &&
       request.restResourceId.isNotEmpty) {
     try {
@@ -732,6 +731,175 @@ Future<List<List<List<LatLng>>>> loadTraveledLegPoints(
   }
 
   return legPaths;
+}
+
+/// Fast local-only paint for details open — no Snap/Directions/server wait.
+///
+/// Order: aligned Hive cache → stored leg polylines → raw Hive/GPS samples.
+Future<List<List<List<LatLng>>>> loadTraveledLegPointsLocalFirst(
+  TravelRequestModel request,
+) async {
+  final cached = await _loadAlignedPaintCache(request);
+  if (cached != null &&
+      cached.any((leg) => leg.any((s) => s.length >= 2))) {
+    return cached;
+  }
+
+  if (request.tripLegs.isEmpty) {
+    final raw = await _loadRawLocalLatLngs(request);
+    if (raw.length >= 2) {
+      return [
+        [simplifyRoutePointsForMap(raw)],
+      ];
+    }
+    return const [];
+  }
+
+  final rawPoints = await _loadRoutePointsLocalOnly(request);
+  final legPaths = <List<List<LatLng>>>[];
+
+  for (final leg in request.tripLegs) {
+    if (leg.routePolylineEncoded != null &&
+        leg.routePolylineEncoded!.isNotEmpty) {
+      final decoded = decodePipePolyline(leg.routePolylineEncoded);
+      if (decoded.length >= 2) {
+        legPaths.add([decoded]);
+        continue;
+      }
+    }
+    if (leg.matchedRoutePolylineEncoded != null &&
+        leg.matchedRoutePolylineEncoded!.isNotEmpty) {
+      final decoded = decodePipePolyline(leg.matchedRoutePolylineEncoded);
+      if (decoded.length >= 2) {
+        legPaths.add([decoded]);
+        continue;
+      }
+    }
+
+    if (leg.departurePunch == null) {
+      legPaths.add(const []);
+      continue;
+    }
+
+    final start = leg.departurePunch!.time.toUtc();
+    final end = leg.arrivalPunch?.time.toUtc() ?? DateTime.now().toUtc();
+    final pts = <LatLng>[];
+    for (final p in rawPoints) {
+      if (p.legId != null && p.legId!.isNotEmpty) {
+        if (p.legId == leg.legId) pts.add(LatLng(p.lat, p.lng));
+        continue;
+      }
+      if (p.time != null) {
+        final t = p.time!.toUtc();
+        if (!t.isBefore(start) && !t.isAfter(end)) {
+          pts.add(LatLng(p.lat, p.lng));
+        }
+      }
+    }
+    if (pts.length >= 2) {
+      legPaths.add([simplifyRoutePointsForMap(pts)]);
+    } else {
+      legPaths.add(const []);
+    }
+  }
+
+  if (!legPaths.any((leg) => leg.any((s) => s.length >= 2))) {
+    final raw = await _loadRawLocalLatLngs(request);
+    if (raw.length >= 2) {
+      return [
+        [simplifyRoutePointsForMap(raw)],
+      ];
+    }
+  }
+
+  return legPaths;
+}
+
+Future<List<LatLng>> _loadRawLocalLatLngs(TravelRequestModel request) async {
+  final fromTimed = await _loadRoutePointsLocalOnly(request);
+  if (fromTimed.length >= 2) {
+    return fromTimed.map((p) => LatLng(p.lat, p.lng)).toList();
+  }
+  if (request.routePoints.isNotEmpty) {
+    final out = <LatLng>[];
+    for (final p in request.routePoints) {
+      final lat = (p['latitude'] as num?)?.toDouble();
+      final lng = (p['longitude'] as num?)?.toDouble();
+      if (lat == null || lng == null) continue;
+      out.add(LatLng(lat, lng));
+    }
+    return out;
+  }
+  return const [];
+}
+
+/// Hive / memory GPS only — never awaits the network.
+Future<
+    List<
+        ({
+          double lat,
+          double lng,
+          DateTime? time,
+          String? legId,
+          String? source,
+          String? pointId,
+        })>> _loadRoutePointsLocalOnly(TravelRequestModel request) async {
+  final requestId = request.requestId.isNotEmpty
+      ? request.requestId
+      : request.restResourceId;
+  final allPointsMap = <Map<String, dynamic>>[];
+
+  final rawCached = _rawRoutePointsMemCache[requestId];
+  if (rawCached != null && rawCached.isNotEmpty) {
+    allPointsMap.addAll(rawCached);
+  }
+
+  if (allPointsMap.isEmpty) {
+    try {
+      final hive = await HiveDatabase.instance
+          .getRoutePointsForRequest(request.requestId);
+      for (final raw in hive) {
+        final m = Map<String, dynamic>.from(raw);
+        final source = m['source']?.toString() ?? '';
+        if (source == GpsGapRoadFill.fillerSource) continue;
+        allPointsMap.add(m);
+      }
+      if (allPointsMap.isNotEmpty) {
+        _rawRoutePointsMemCache[requestId] =
+            List<Map<String, dynamic>>.from(allPointsMap);
+      }
+    } catch (_) {}
+  }
+
+  if (allPointsMap.isEmpty && request.routePoints.isNotEmpty) {
+    allPointsMap.addAll(request.routePoints);
+  }
+
+  final normalized = allPointsMap
+      .map((m) {
+        final lat = (m['latitude'] as num?)?.toDouble() ??
+            (m['lat'] as num?)?.toDouble() ??
+            0.0;
+        final lng = (m['longitude'] as num?)?.toDouble() ??
+            (m['lng'] as num?)?.toDouble() ??
+            0.0;
+        final time = GpsGapRoadFill.parseTimestamp(m['timestamp']);
+        final legId = m['legId']?.toString();
+        final source = m['source']?.toString();
+        final pointId = m['pointId']?.toString();
+        return (
+          lat: lat,
+          lng: lng,
+          time: time,
+          legId: legId,
+          source: source,
+          pointId: pointId,
+        );
+      })
+      .where((p) => p.lat != 0.0 && p.lng != 0.0)
+      .toList();
+
+  return _dedupeRouteSamples(normalized);
 }
 
 /// Haversine length of painted path segments (km).

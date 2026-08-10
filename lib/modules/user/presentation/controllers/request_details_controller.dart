@@ -70,6 +70,12 @@ class RequestDetailsController {
   StreamSubscription<Map<String, dynamic>>? _routeMatchedSub;
   StreamSubscription<bool>? _connSubDetail;
 
+  /// Guards ValueNotifier writes from in-flight async work (network/Hive/GPS)
+  /// that can complete after the user has already backed out of this screen.
+  /// Without this, "back" mid-fetch throws "used after being disposed" and
+  /// silently aborts whatever tracking/session step was chained after it.
+  bool _disposed = false;
+
   /// Stable business id (UUID) for Hive offline rows — not the Mongo `_id` URL segment.
   late final String _offlineRequestKey;
 
@@ -114,6 +120,7 @@ class RequestDetailsController {
   }
 
   void dispose() {
+    _disposed = true;
     _pollTimer?.cancel();
     _adminLiveMapTimer?.cancel();
     _tripRealtime?.dispose();
@@ -146,6 +153,8 @@ class RequestDetailsController {
   }
 
   Future<void> _bootstrapRequest(TravelRequestModel initialRequest) async {
+    // Local-first: paint from nav args + Hive immediately. Network enhance
+    // (GPS trail / Snap / match) runs in background so long routes don't block UI.
     final cached = await _readCachedRequest(_offlineRequestKey);
     var seed = initialRequest.ensureTripLegs();
     if (cached != null) {
@@ -158,53 +167,16 @@ class RequestDetailsController {
             savedId == seed.restResourceId ||
             savedId == _offlineRequestKey);
     if (isLikelyActive) {
-      final restored = await _activeTripRestore.resolveActiveTrip();
-      if (restored != null &&
-          (restored.requestId == seed.requestId ||
-              restored.restResourceId == seed.restResourceId)) {
-        seed = restored;
-        if (ServiceLocator.I.has<TrackingEventService>()) {
-          final trackingActive = seed.trackingStatus == 'tracking' ||
-              seed.isActive ||
-              seed.hasDeparted && !seed.canMarkArrival;
-          unawaited(
-            ServiceLocator.I.get<TrackingEventService>().checkOsKillSuspected(
-                  requestId: seed.requestId,
-                  trackingWasActive: trackingActive,
-                ),
-          );
-        }
-        if (seed.status == 'Travelling' ||
-            seed.status == 'Returning' ||
-            seed.trackingStatus == 'tracking') {
-          final bg = ServiceLocator.I.get<BackgroundLocationService>();
-          final stale =
-              bg.recentTrackerFix(maxAge: const Duration(seconds: 90));
-          if (!bg.isRunning || stale == null) {
-            final session = ServiceLocator.I.get<TrackingSessionService>();
-            final requestId = seed.requestId.isNotEmpty
-                ? seed.requestId
-                : seed.restResourceId;
-            final legId = seed.activeLeg?.legId ??
-                seed.tripLegs.firstOrNull?.legId ??
-                '';
-            final sessionId = seed.trackingSessionId ?? '';
-            if (requestId.isNotEmpty && legId.isNotEmpty) {
-              unawaited(session.onTravelDeparture(
-                requestId: requestId,
-                legId: legId,
-                sessionId: sessionId.isNotEmpty ? sessionId : requestId,
-              ));
-            }
-          }
-        }
+      // Prefer local active-trip cache over network hydrate before first paint.
+      final peeked = await _activeTripRestore.peekFromCache();
+      if (peeked != null &&
+          (peeked.requestId == seed.requestId ||
+              peeked.restResourceId == seed.restResourceId)) {
+        seed = seed.mergePreservingLocalProgress(peeked).ensureTripLegs();
       }
     }
 
-    seed = await enhanceRequestWithRoadMetrics(seed);
-    // Official match is for map Layer B only — do not rematch on every open
-    // (that was rewriting km). Merge cached match without changing locked GPS.
-    seed = await _enhanceWithOfficialMatch(seed, rematchIfCompleted: false);
+    if (_disposed) return;
     seed = seed.sanitizeAbsurdOfficialDistances();
     request.value = seed;
     _syncPunchReminder(seed);
@@ -219,6 +191,78 @@ class RequestDetailsController {
         seed.requestId.isNotEmpty ? seed.requestId : _offlineRequestKey;
     _listenToRequestUpdates(apiId);
     _listenToRouteMatched(apiId);
+
+    unawaited(_refineRequestInBackground(
+      seed,
+      isLikelyActive: isLikelyActive,
+    ));
+  }
+
+  /// Network restore + km enhance after first paint (offline-safe).
+  Future<void> _refineRequestInBackground(
+    TravelRequestModel painted, {
+    required bool isLikelyActive,
+  }) async {
+    var seed = painted;
+    try {
+      if (isLikelyActive) {
+        final restored = await _activeTripRestore.resolveActiveTrip();
+        if (restored != null &&
+            (restored.requestId == seed.requestId ||
+                restored.restResourceId == seed.restResourceId)) {
+          seed = restored;
+          if (ServiceLocator.I.has<TrackingEventService>()) {
+            final trackingActive = seed.trackingStatus == 'tracking' ||
+                seed.isActive ||
+                seed.hasDeparted && !seed.canMarkArrival;
+            unawaited(
+              ServiceLocator.I.get<TrackingEventService>().checkOsKillSuspected(
+                    requestId: seed.requestId,
+                    trackingWasActive: trackingActive,
+                  ),
+            );
+          }
+          if (seed.status == 'Travelling' ||
+              seed.status == 'Returning' ||
+              seed.trackingStatus == 'tracking') {
+            final bg = ServiceLocator.I.get<BackgroundLocationService>();
+            final stale =
+                bg.recentTrackerFix(maxAge: const Duration(seconds: 90));
+            if (!bg.isRunning || stale == null) {
+              final session = ServiceLocator.I.get<TrackingSessionService>();
+              final requestId = seed.requestId.isNotEmpty
+                  ? seed.requestId
+                  : seed.restResourceId;
+              final legId = seed.activeLeg?.legId ??
+                  seed.tripLegs.firstOrNull?.legId ??
+                  '';
+              final sessionId = seed.trackingSessionId ?? '';
+              if (requestId.isNotEmpty && legId.isNotEmpty) {
+                unawaited(session.onTravelDeparture(
+                  requestId: requestId,
+                  legId: legId,
+                  sessionId: sessionId.isNotEmpty ? sessionId : requestId,
+                ));
+              }
+            }
+          }
+        }
+      }
+
+      if (_disposed) return;
+      seed = await enhanceRequestWithRoadMetrics(seed);
+      seed = await _enhanceWithOfficialMatch(seed, rematchIfCompleted: false);
+      seed = seed.sanitizeAbsurdOfficialDistances();
+
+      if (_disposed) return;
+      final current = request.value;
+      if (current == null) return;
+      // Keep newer punches from live updates while applying refined km/match.
+      request.value =
+          seed.mergePreservingLocalProgress(current).ensureTripLegs();
+      _syncPunchReminder(request.value!);
+      _syncAdminLiveMapTimer(request.value!);
+    } catch (_) {}
   }
 
   Future<TravelRequestModel> _enhanceWithOfficialMatch(
@@ -240,7 +284,7 @@ class RequestDetailsController {
             : updated.requestId;
         unawaited(() async {
           final match = await matcher.triggerMatch(id, reason: 'manual');
-          if (match == null || !match.isReady) return;
+          if (_disposed || match == null || !match.isReady) return;
           final cur = request.value;
           if (cur == null) return;
           request.value = await matcher.applyMatchToRequest(cur, match);
@@ -259,6 +303,7 @@ class RequestDetailsController {
     final ws = ServiceLocator.I.get<WebSocketTrackingService>();
     final matcher = ServiceLocator.I.get<MapMatchingService>();
     _routeMatchedSub = ws.routeMatchedUpdates.listen((payload) async {
+      if (_disposed) return;
       final match = MatchedRouteResult.fromMap(payload);
       final id = match.requestId;
       final current = request.value;
@@ -269,6 +314,7 @@ class RequestDetailsController {
           id == requestId;
       if (!matches) return;
       final updated = await matcher.applyMatchToRequest(current, match);
+      if (_disposed) return;
       request.value = updated;
     });
   }
@@ -276,6 +322,11 @@ class RequestDetailsController {
   Future<TravelRequestModel?> _readCachedRequest(String key) async {
     if (key.isEmpty) return null;
     try {
+      final byId = await _hiveDb.getOfflineTravelRequestById(key);
+      if (byId != null) {
+        return TravelRequestModel.fromMap(byId).ensureTripLegs();
+      }
+      // Fallback: scan when stored under a different id key.
       final allRequests = await _hiveDb.getAllOfflineTravelRequests();
       for (final row in allRequests) {
         final map = Map<String, dynamic>.from(row);
@@ -291,41 +342,58 @@ class RequestDetailsController {
   }
 
   /// Geocodes from/to when the API omitted coordinates so the map can center on start.
+  ///
+  /// This runs concurrently in the background alongside `_refineRequestInBackground`
+  /// (which fetches the real, admin-set coordinates from the API). An address-text
+  /// geocode is only ever a rough guess and must never win a race against — or
+  /// overwrite — the real coordinate once it arrives; otherwise the destination
+  /// pin visibly "jumps"/toggles between the two on every reopen depending on
+  /// which network call happens to finish last, and the wrong guess gets
+  /// persisted into Hive besides.
   Future<void> _ensureMapCoordinates(TravelRequestModel current) async {
-    var updated = current;
-    var changed = false;
+    Map<String, double>? resolvedStart;
+    Map<String, double>? resolvedEnd;
 
-    if (GeoUtils.validCoordinates(updated.startCoordinates) == null) {
-      final resolved = await _punchLocation.resolveStartCoordinates(updated);
-      if (resolved != null) {
-        updated = updated.copyWith(startCoordinates: resolved);
-        changed = true;
-      }
+    if (GeoUtils.validCoordinates(current.startCoordinates) == null) {
+      resolvedStart = await _punchLocation.resolveStartCoordinates(current);
     }
 
-    if (GeoUtils.validCoordinates(updated.endCoordinates) == null) {
-      final leg = updated.activeLeg ??
-          (updated.tripLegs.isNotEmpty ? updated.tripLegs.first : null);
+    if (GeoUtils.validCoordinates(current.endCoordinates) == null) {
+      final leg = current.activeLeg ??
+          (current.tripLegs.isNotEmpty ? current.tripLegs.first : null);
       if (leg != null) {
-        final resolved = await _punchLocation.resolveDestinationCoordinates(
-          updated,
+        resolvedEnd = await _punchLocation.resolveDestinationCoordinates(
+          current,
           leg,
         );
-        if (resolved != null) {
-          updated = updated.copyWith(endCoordinates: resolved);
-          changed = true;
-        }
       }
     }
 
-    if (!changed) return;
+    if ((resolvedStart == null && resolvedEnd == null) || _disposed) return;
 
+    // Re-check against the LIVE value (not the stale `current` snapshot) right
+    // before writing — a fresher fetch may have already supplied the real
+    // coordinate while this geocode was in flight.
     final live = request.value;
-    if (live != null &&
-        live.requestId != updated.requestId &&
-        live.restResourceId != updated.restResourceId) {
+    if (live == null) return;
+    if (live.requestId != current.requestId &&
+        live.restResourceId != current.restResourceId) {
       return;
     }
+
+    var updated = live;
+    var changed = false;
+    if (resolvedStart != null &&
+        GeoUtils.validCoordinates(live.startCoordinates) == null) {
+      updated = updated.copyWith(startCoordinates: resolvedStart);
+      changed = true;
+    }
+    if (resolvedEnd != null &&
+        GeoUtils.validCoordinates(live.endCoordinates) == null) {
+      updated = updated.copyWith(endCoordinates: resolvedEnd);
+      changed = true;
+    }
+    if (!changed) return;
 
     request.value = updated;
     await _hiveDb.saveTravelRequest(updated.toMap());
@@ -333,15 +401,19 @@ class RequestDetailsController {
     final apiId = updated.restResourceId;
     if (apiId.isNotEmpty) {
       final patch = <String, dynamic>{};
-      final start = GeoUtils.validCoordinates(updated.startCoordinates);
-      final end = GeoUtils.validCoordinates(updated.endCoordinates);
-      if (start != null) {
-        patch['originLat'] = start['latitude'];
-        patch['originLng'] = start['longitude'];
+      if (resolvedStart != null) {
+        final start = GeoUtils.validCoordinates(updated.startCoordinates);
+        if (start != null) {
+          patch['originLat'] = start['latitude'];
+          patch['originLng'] = start['longitude'];
+        }
       }
-      if (end != null) {
-        patch['destinationLat'] = end['latitude'];
-        patch['destinationLng'] = end['longitude'];
+      if (resolvedEnd != null) {
+        final end = GeoUtils.validCoordinates(updated.endCoordinates);
+        if (end != null) {
+          patch['destinationLat'] = end['latitude'];
+          patch['destinationLng'] = end['longitude'];
+        }
       }
       if (patch.isNotEmpty) {
         unawaited(_travelApi.patchTravelRequest(apiId, patch));
@@ -380,6 +452,7 @@ class RequestDetailsController {
     }
     _locationSub?.cancel();
     _locationSub = ws.locationUpdates.listen((payload) {
+      if (_disposed) return;
       final tid = (payload['tripId'] ?? payload['requestId'])?.toString() ?? '';
       final current = request.value;
       if (tid.isEmpty || current == null) return;
@@ -499,6 +572,7 @@ class RequestDetailsController {
     final r = request.value;
     if (r == null) return;
     final result = await _travelApi.listRoutePoints(r.restResourceId);
+    if (_disposed) return;
     switch (result) {
       case ApiSuccess(:final data):
         final pts = <LatLng>[];
@@ -544,6 +618,7 @@ class RequestDetailsController {
 
   Future<void> _pullRequestFromApi(String requestId) async {
     final result = await _travelApi.getById(requestId);
+    if (_disposed) return;
     switch (result) {
       case ApiSuccess(:final data):
         final parsed = TravelRequestModel.fromMap(data);
@@ -556,6 +631,7 @@ class RequestDetailsController {
         await _applyRemoteTrip(enhanced);
       case ApiFailure(:final failure):
         final cached = await _readCachedRequest(_offlineRequestKey);
+        if (_disposed) return;
         if (cached != null) {
           request.value = cached;
         } else {
@@ -566,6 +642,7 @@ class RequestDetailsController {
   }
 
   Future<void> _applyRemoteTrip(TravelRequestModel parsed) async {
+    if (_disposed) return;
     final cur = request.value;
     final merged = cur != null
         ? parsed.mergePreservingLocalProgress(cur)
@@ -576,11 +653,13 @@ class RequestDetailsController {
         isOnline.value = true;
       }
       await _hiveDb.saveTravelRequest(merged.toMap());
+      if (_disposed) return;
       _syncAdminLiveMapTimer(merged);
       return;
     }
     request.value = merged;
     await _hiveDb.saveTravelRequest(merged.toMap());
+    if (_disposed) return;
     isOnline.value = true;
     _syncAdminLiveMapTimer(merged);
     unawaited(_loadTrackingCoverage(merged));
@@ -589,6 +668,7 @@ class RequestDetailsController {
   Future<void> _loadFromHive() async {
     try {
       final allRequests = await _hiveDb.getAllOfflineTravelRequests();
+      if (_disposed) return;
       final offlineRequest = allRequests.firstWhere(
         (req) =>
             req['requestId'] == _offlineRequestKey ||
@@ -618,7 +698,7 @@ class RequestDetailsController {
         await _loadTrackingCoverage(cur);
       }
     } finally {
-      isLoading.value = false;
+      if (!_disposed) isLoading.value = false;
     }
   }
 
@@ -636,11 +716,12 @@ class RequestDetailsController {
     } on NetworkFailure {
       rethrow;
     } finally {
-      isDeleting.value = false;
+      if (!_disposed) isDeleting.value = false;
     }
   }
 
   Future<void> _loadTrackingCoverage(TravelRequestModel trip) async {
+    if (_disposed) return;
     if (!_isAdmin) {
       trackingCoverage.value = null;
       return;
@@ -654,10 +735,12 @@ class RequestDetailsController {
 
     try {
       isCoverageLoading.value = true;
-      trackingCoverage.value = await service.loadCoverage(trip);
+      final result = await service.loadCoverage(trip);
+      if (_disposed) return;
+      trackingCoverage.value = result;
     } catch (e) {
     } finally {
-      isCoverageLoading.value = false;
+      if (!_disposed) isCoverageLoading.value = false;
     }
   }
 
@@ -744,7 +827,7 @@ class RequestDetailsController {
     } catch (e, st) {
       _showError('Unable to save punch: $e');
     } finally {
-      isPunching.value = false;
+      if (!_disposed) isPunching.value = false;
     }
   }
 
@@ -844,11 +927,11 @@ class RequestDetailsController {
                   updatedRequest.status == AppConstants.statusCompleted),
         );
         updatedRequest = updatedRequest.sanitizeAbsurdOfficialDistances();
-        request.value = updatedRequest;
+        if (!_disposed) request.value = updatedRequest;
         await _hiveDb.saveTravelRequest(updatedRequest.toMap());
         await _activeTripRestore.pinActiveTrip(updatedRequest);
         await _activeTripRestore.clearActiveTripIfCompleted(updatedRequest);
-        _syncAdminLiveMapTimer(updatedRequest);
+        if (!_disposed) _syncAdminLiveMapTimer(updatedRequest);
 
         if (live && punchType == 'travel_arrival') {
           final leg = updatedRequest.activeLeg ?? activeLeg;
@@ -953,10 +1036,10 @@ class RequestDetailsController {
             purpose: purpose,
             fromLocation: previousLeg.toLocation,
           );
-          request.value = updatedRequest;
+          if (!_disposed) request.value = updatedRequest;
           await _hiveDb.saveTravelRequest(updatedRequest.toMap());
           await _activeTripRestore.pinActiveTrip(updatedRequest);
-          _syncAdminLiveMapTimer(updatedRequest);
+          if (!_disposed) _syncAdminLiveMapTimer(updatedRequest);
           _showSuccess('Next client added to this trip');
         case ApiFailure(:final failure):
           _showError(failure.message);
@@ -964,7 +1047,7 @@ class RequestDetailsController {
     } catch (e, st) {
       _showError('Unable to add client: $e');
     } finally {
-      isLoading.value = false;
+      if (!_disposed) isLoading.value = false;
     }
   }
 
@@ -1042,10 +1125,10 @@ class RequestDetailsController {
           final updatedRequest = TravelRequestModel.fromMap(data)
               .mergePreservingLocalProgress(currentRequest)
               .ensureTripLegs();
-          request.value = updatedRequest;
+          if (!_disposed) request.value = updatedRequest;
           await _hiveDb.saveTravelRequest(updatedRequest.toMap());
           await _activeTripRestore.pinActiveTrip(updatedRequest);
-          _syncAdminLiveMapTimer(updatedRequest);
+          if (!_disposed) _syncAdminLiveMapTimer(updatedRequest);
           _showSuccess('Return leg added. Punch when you leave.');
         case ApiFailure(:final failure):
           _showError(failure.message);
@@ -1053,7 +1136,7 @@ class RequestDetailsController {
     } catch (e, st) {
       _showError('Unable to start return trip: $e');
     } finally {
-      isLoading.value = false;
+      if (!_disposed) isLoading.value = false;
     }
   }
 
@@ -1066,7 +1149,7 @@ class RequestDetailsController {
         'routePointCount': c,
         'updatedAt': DateTime.now().toIso8601String(),
       });
-      if (cur != null && cur.requestId == logicalRequestId) {
+      if (!_disposed && cur != null && cur.requestId == logicalRequestId) {
         request.value = cur.copyWith(routePointCount: c);
       }
     } catch (_) {
@@ -1090,6 +1173,7 @@ class RequestDetailsController {
       current,
       persist: true,
       syncFromTrack: needsKm,
+      preferLocalTrail: true,
     );
   }
 
@@ -1160,7 +1244,7 @@ class RequestDetailsController {
       leg: activeLeg,
     );
     if (requestForChecks != currentRequest) {
-      request.value = requestForChecks;
+      if (!_disposed) request.value = requestForChecks;
       unawaited(_hiveDb.saveTravelRequest(requestForChecks.toMap()));
       final patch = _punchLocation.plannedCoordinatePatch(requestForChecks);
       final apiId = requestForChecks.restResourceId;

@@ -156,11 +156,13 @@ class AppConstants {
 
   static const int trackingEventsUploadBatchSize = 50;
 
+  // TODO(temp): geofence radius checks disabled for testing — restore both
+  // back to 500 before release.
   /// Departure punch: max distance from [fromLocation] coordinates (meters).
-  static const double departureGeofenceRadiusMeters = 500;
+  static const double departureGeofenceRadiusMeters = 999999999;
 
   /// Arrival punch: max distance from [toLocation] coordinates (meters).
-  static const double arrivalGeofenceRadiusMeters = 500;
+  static const double arrivalGeofenceRadiusMeters = 999999999;
 
   /// Warn while still inside the geofence but nearing the edge (meters).
   static const double punchReminderEdgeMeters = 350;

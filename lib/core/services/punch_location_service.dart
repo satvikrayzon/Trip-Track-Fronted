@@ -8,14 +8,43 @@ import 'package:http/http.dart' as http;
 
 import '../config/google_maps_config.dart';
 import '../constants/app_constants.dart';import '../utils/geo_utils.dart';
+import '../di/service_locator.dart';
 import '../../modules/travel/data/models/travel_request_model.dart';
+import 'background_location_service.dart';
 
 const bool bypassGeofenceChecks = false; // Temporary testing flag
+
+/// Max plausible hop (meters) between two "current position" reads a few
+/// seconds apart. Anything beyond this is a bad fix (stale cache, network
+/// geo-IP fallback, cross-country jump) — never trust it for a punch.
+const double _kMaxPlausiblePunchJumpMeters = 3000;
 
 /// Fast, accurate GPS reads for trip punches + departure geofence checks.
 class PunchLocationService {
   Position? _cachedPosition;
   DateTime? _cachedAt;
+
+  /// Live-tracking fix (Kalman-filtered, jump-gated) used as ground truth to
+  /// reject wildly wrong "current position" reads (e.g. iOS returning a
+  /// stale/geo-IP fix "in another country").
+  Position? _trustedAnchor() {
+    if (!ServiceLocator.I.has<BackgroundLocationService>()) return null;
+    final bg = ServiceLocator.I.get<BackgroundLocationService>();
+    return bg.recentTrackerFix(maxAge: const Duration(minutes: 2));
+  }
+
+  /// True when [candidate] is implausibly far from the trusted live-tracking
+  /// anchor (same trip, same few seconds) — i.e. almost certainly a bad fix.
+  bool _isSuspicious(Position candidate, Position? anchor) {
+    if (anchor == null) return false;
+    final d = GeoUtils.distanceMeters(
+      candidate.latitude,
+      candidate.longitude,
+      anchor.latitude,
+      anchor.longitude,
+    );
+    return d > _kMaxPlausiblePunchJumpMeters;
+  }
 
   Future<bool> ensurePermissions() async {
     if (!await Geolocator.isLocationServiceEnabled()) {
@@ -56,13 +85,19 @@ class PunchLocationService {
   }) async {
     if (!await ensurePermissions()) return null;
 
+    // Ground truth from the live tracker (if this trip is already tracking).
+    // A "current position" read that disagrees wildly with this is a bad fix
+    // (iOS geo-IP/stale-cache "wrong country" jump) and must never be trusted.
+    final anchor = _trustedAnchor();
+
     final cached = _cachedPosition;
     final cachedAt = _cachedAt;
     if (cached != null &&
         cachedAt != null &&
         DateTime.now().difference(cachedAt) <=
             AppConstants.punchCachedPositionMaxAge &&
-        cached.accuracy <= maxAccuracyMeters) {
+        cached.accuracy <= maxAccuracyMeters &&
+        !_isSuspicious(cached, anchor)) {
       return cached;
     }
 
@@ -70,7 +105,8 @@ class PunchLocationService {
     if (lastKnown != null) {
       final age = DateTime.now().difference(lastKnown.timestamp);
       if (age <= AppConstants.punchLastKnownMaxAge &&
-          lastKnown.accuracy <= maxAccuracyMeters) {
+          lastKnown.accuracy <= maxAccuracyMeters &&
+          !_isSuspicious(lastKnown, anchor)) {
         _remember(lastKnown);
         return lastKnown;
       }
@@ -83,17 +119,52 @@ class PunchLocationService {
           timeLimit: timeout,
         ),
       ).timeout(timeout);
+
+      if (!_isSuspicious(current, anchor)) {
+        _remember(current);
+        return current;
+      }
+
+      // Bad fix vs. the live tracker — one retry at best accuracy before
+      // giving up (common right after iOS wakes location services).
+      try {
+        final retry = await Geolocator.getCurrentPosition(
+          locationSettings: LocationSettings(
+            accuracy: LocationAccuracy.best,
+            timeLimit: timeout,
+          ),
+        ).timeout(timeout);
+        if (!_isSuspicious(retry, anchor)) {
+          _remember(retry);
+          return retry;
+        }
+      } catch (_) {}
+
+      // Still disagrees with the live trail — trust the trail, not the jump.
+      if (anchor != null) return anchor;
       _remember(current);
       return current;
     } on TimeoutException {
     } catch (e) {
     }
 
-    if (lastKnown != null) {
+    if (anchor != null) return anchor;
+
+    if (lastKnown != null &&
+        !_isSuspicious(lastKnown, anchor) &&
+        DateTime.now().difference(lastKnown.timestamp) <=
+            const Duration(minutes: 15)) {
       _remember(lastKnown);
       return lastKnown;
     }
-    return cached;
+    if (cached != null &&
+        cachedAt != null &&
+        !_isSuspicious(cached, anchor) &&
+        DateTime.now().difference(cachedAt) <= const Duration(minutes: 15)) {
+      return cached;
+    }
+    // Honest "GPS unavailable" beats guessing with a wrong-country fix.
+    return null;
   }
 
   Future<Map<String, double>?> resolveStartCoordinates(

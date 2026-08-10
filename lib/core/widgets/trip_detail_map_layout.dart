@@ -66,6 +66,38 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
   Timer? _liveReloadDebounce;
   int _routeLoadGeneration = 0;
 
+  /// True while the user's finger is actively panning/zooming the map.
+  /// Route/GPS updates that arrive mid-gesture are queued (see
+  /// [_pendingPointsUpdate]) so we never rebuild the polyline layer while
+  /// the platform view is mid-drag — that's what caused the map to feel
+  /// laggy/jerky when a location tick landed during a swipe.
+  bool _isCameraMoving = false;
+  List<List<List<LatLng>>>? _pendingPointsUpdate;
+
+  /// google_maps_flutter's `onCameraMoveStarted` fires for BOTH real user
+  /// gestures AND our own `animateCamera()` calls — it doesn't distinguish
+  /// them. Without this flag, every auto-follow tick would immediately look
+  /// like "the user dragged the map" and permanently kill live-follow mode
+  /// (it would die on the very first tick after being (re)enabled). Route
+  /// every programmatic camera move through [_animateCamera] so the move-start
+  /// callback can tell the two apart.
+  bool _programmaticCameraMove = false;
+
+  Future<void> _animateCamera(
+    GoogleMapController controller,
+    CameraUpdate update,
+  ) async {
+    _programmaticCameraMove = true;
+    try {
+      await controller.animateCamera(update);
+    } finally {
+      // onCameraMoveStarted can arrive a frame after the future resolves.
+      unawaited(Future.delayed(const Duration(milliseconds: 80), () {
+        _programmaticCameraMove = false;
+      }));
+    }
+  }
+
   String _routePointsCacheKey = '';
   List<List<List<LatLng>>>? _resolvedPoints;
   double? _trackedPathKm;
@@ -357,12 +389,31 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     _followLiveCamera(tip);
   }
 
-  void _followLiveCamera(LatLng tip) {
+  void _followLiveCamera(LatLng tip, {bool forceZoom = false}) {
     if (!_cameraFollowLive || _userMovedCamera) return;
     if (!_isLiveTrip && !_isLiveServer) return;
     final c = _mapController;
     if (c == null) return;
-    unawaited(c.animateCamera(CameraUpdate.newLatLng(tip)));
+    // Nav-style: keep the moving dot centered and reasonably zoomed in,
+    // never fight a zoom level the user picked (only bump it up, never down).
+    if (forceZoom) {
+      unawaited(_animateCamera(c, CameraUpdate.newLatLngZoom(tip, 16.5)));
+    } else {
+      unawaited(_animateCamera(c, CameraUpdate.newLatLng(tip)));
+    }
+  }
+
+  /// Google-Maps-navigation-style "recenter" — re-engages auto follow after
+  /// the user panned away, and snaps back onto the live current-location dot.
+  void _resumeLiveFollow() {
+    setState(() {
+      _userMovedCamera = false;
+      _cameraFollowLive = true;
+    });
+    final pts = _activePoints;
+    if (pts == null) return;
+    final flat = _flattenPaths(pts);
+    if (flat.isNotEmpty) _followLiveCamera(flat.last, forceZoom: true);
   }
 
   void _initSheetController() {
@@ -437,27 +488,10 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
       _resolvedPoints = null;
       _trackedPathKm = null;
     }
-    final isCompleted = _isCompletedTrip;
     final gen = ++_routeLoadGeneration;
-    final loadFuture = () async {
-      // ignore: avoid_print
-      // Prefer per-leg paths so Whole route paints distinct colors per leg.
-      final legs = await loadTraveledLegPoints(widget.request);
-      final hasLegPaint = legs.any((leg) => leg.any((s) => s.length >= 2));
-      if (hasLegPaint) {
-        // ignore: avoid_print
-        return legs;
-      }
-      final whole = await loadWholeTripPathFilled(widget.request);
-      if (whole.isNotEmpty) {
-        // ignore: avoid_print
-        return [whole];
-      }
-      // ignore: avoid_print
-      return <List<List<LatLng>>>[];
-    }()
-        .then((pts) {
-      if (!mounted || gen != _routeLoadGeneration) return pts;
+
+    void applyPoints(List<List<List<LatLng>>> pts, {required bool fitCamera}) {
+      if (!mounted || gen != _routeLoadGeneration) return;
       final flat = <LatLng>[
         for (final leg in pts)
           for (final seg in leg)
@@ -468,22 +502,52 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
           for (final seg in leg)
             if (seg.length >= 2) seg,
       ]);
-      // ignore: avoid_print
+      // Never rebuild the polyline layer mid-gesture — queue it and flush
+      // on onCameraIdle instead, so panning/zooming stays smooth.
+      if (_isCameraMoving && !fitCamera) {
+        _pendingPointsUpdate = pts;
+        _trackedPathKm = trackedKm > 0.05 ? trackedKm : _trackedPathKm;
+        return;
+      }
+      _pendingPointsUpdate = null;
       setState(() {
         _resolvedPoints = pts;
         _trackedPathKm = trackedKm > 0.05 ? trackedKm : null;
       });
-      // Fit bounds only on first paint / trip change — not every live tick.
-      if (!keepPrevious || _lastCameraPathSig == null) {
+      if (fitCamera && (!keepPrevious || _lastCameraPathSig == null)) {
         _lastCameraPathSig = null;
         _moveCameraToStartIfNeeded();
       } else if (_isLiveTrip || _isLiveServer) {
         final tip = flat.isNotEmpty ? flat.last : null;
         if (tip != null) _followLiveCamera(tip);
       }
-      return pts;
-    });
-    unawaited(loadFuture);
+    }
+
+    // Phase 1: local Hive / polyline / cache — clear loader ASAP (offline-first).
+    unawaited(() async {
+      final local = await loadTraveledLegPointsLocalFirst(widget.request);
+      final hasLocal =
+          local.any((leg) => leg.any((s) => s.length >= 2));
+      if (hasLocal) {
+        applyPoints(local, fitCamera: true);
+      }
+
+      // Phase 2: road-align / server refresh when needed (refine in place).
+      final legs = await loadTraveledLegPoints(widget.request);
+      final hasLegPaint = legs.any((leg) => leg.any((s) => s.length >= 2));
+      if (hasLegPaint) {
+        applyPoints(legs, fitCamera: !hasLocal);
+        return;
+      }
+      final whole = await loadWholeTripPathFilled(widget.request);
+      if (whole.isNotEmpty) {
+        applyPoints([whole], fitCamera: !hasLocal);
+        return;
+      }
+      if (!hasLocal && mounted && gen == _routeLoadGeneration) {
+        applyPoints(const [], fitCamera: true);
+      }
+    }());
   }
 
   /// Same km as list cards — never use painted-path length (it drifts every
@@ -576,7 +640,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     }
     _lastCameraTarget = target;
     unawaited(
-      controller.animateCamera(CameraUpdate.newLatLngZoom(target, 14)),
+      _animateCamera(controller, CameraUpdate.newLatLngZoom(target, 14)),
     );
   }
 
@@ -634,7 +698,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
 
     final display = mapDisplayRoutePoints(pts);
     if (display.length == 1) {
-      await c.animateCamera(CameraUpdate.newLatLngZoom(display.first, 14));
+      await _animateCamera(c, CameraUpdate.newLatLngZoom(display.first, 14));
       return;
     }
 
@@ -655,7 +719,8 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
     final padLng = (lngDelta * 0.15).clamp(0.0006, 0.015);
 
     try {
-      await c.animateCamera(
+      await _animateCamera(
+        c,
         CameraUpdate.newLatLngBounds(
           LatLngBounds(
             southwest: LatLng(minLat - padLat, minLng - padLng),
@@ -665,7 +730,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         ),
       );
     } catch (_) {
-      await c.animateCamera(CameraUpdate.newLatLngZoom(display.first, 15));
+      await _animateCamera(c, CameraUpdate.newLatLngZoom(display.first, 15));
     }
   }
 
@@ -929,10 +994,30 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         });
       },
       onCameraMoveStarted: () {
+        _isCameraMoving = true;
+        // Ignore moves we triggered ourselves (auto-follow/fit) — only a
+        // real user gesture should ever kick the camera out of follow mode.
+        if (_programmaticCameraMove) return;
         // User panned/zoomed — stop fighting their gesture with auto-fit.
-        if (_isLiveTrip || _isLiveServer) {
-          _userMovedCamera = true;
-          _cameraFollowLive = false;
+        // Only rebuild once per transition (shows the recenter FAB), never
+        // per-frame, so dragging stays smooth.
+        if ((_isLiveTrip || _isLiveServer) && _cameraFollowLive) {
+          setState(() {
+            _userMovedCamera = true;
+            _cameraFollowLive = false;
+          });
+        }
+      },
+      onCameraIdle: () {
+        _isCameraMoving = false;
+        // A GPS/route update may have arrived mid-drag — flush it now
+        // instead of rebuilding polylines while the user was panning.
+        if (_pendingPointsUpdate != null && mounted) {
+          final pts = _pendingPointsUpdate!;
+          _pendingPointsUpdate = null;
+          setState(() {
+            _resolvedPoints = pts;
+          });
         }
       },
       padding: EdgeInsets.only(
@@ -1133,6 +1218,9 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         : 0.0;
     final bottomOffset = _aboveSheetBottom(screenH, gap: 12) + actionLift;
 
+    final showRecenter =
+        (_isLiveTrip || _isLiveServer) && !_cameraFollowLive;
+
     return Positioned(
       right: 14,
       bottom: bottomOffset,
@@ -1141,6 +1229,15 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            if (showRecenter) ...[
+              _FloatingMapButton(
+                icon: Icons.navigation_rounded,
+                tooltip: 'Recenter on my location',
+                highlighted: true,
+                onPressed: _resumeLiveFollow,
+              ),
+              const SizedBox(height: 10),
+            ],
             _FloatingMapButton(
               icon: Icons.my_location_rounded,
               tooltip: 'Fit route',
@@ -1379,11 +1476,13 @@ class _FloatingMapButton extends StatelessWidget {
     required this.icon,
     required this.onPressed,
     this.tooltip,
+    this.highlighted = false,
   });
 
   final IconData icon;
   final VoidCallback onPressed;
   final String? tooltip;
+  final bool highlighted;
 
   @override
   Widget build(BuildContext context) {
@@ -1391,10 +1490,14 @@ class _FloatingMapButton extends StatelessWidget {
       elevation: 4,
       shadowColor: Colors.black26,
       shape: const CircleBorder(),
-      color: Colors.white,
+      color: highlighted ? AppColors.primary : Colors.white,
       child: IconButton(
         tooltip: tooltip,
-        icon: Icon(icon, color: AppColors.textPrimary, size: 22),
+        icon: Icon(
+          icon,
+          color: highlighted ? Colors.white : AppColors.textPrimary,
+          size: 22,
+        ),
         onPressed: onPressed,
       ),
     );

@@ -213,7 +213,7 @@ class _AdminTravelRequestsScreenState extends State<AdminTravelRequestsScreen> {
                               AppNavigation.to(
                                 AppRoutes.userRequestDetails,
                                 arguments: request,
-                              ).then((_) => _controller.refresh()),
+                              ).then((_) => _controller.refresh(silent: true)),
                             ),
                         onDelete: () => _handleDeleteRequest(request));
                   },

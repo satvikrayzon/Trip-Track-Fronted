@@ -1,4 +1,9 @@
+import 'dart:async';
+
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:path_provider/path_provider.dart';
+
+import 'hive_io_delete_export.dart';
 
 /// Hive database configuration and initialization
 class HiveDatabase {
@@ -24,31 +29,58 @@ class HiveDatabase {
 
   /// Initialize the Hive database
   Future<void> initialize() async {
+    await Hive.initFlutter();
+
+    _syncQueueBox = await _openMapBox('sync_queue');
+    _offlineImagesBox = await _openMapBox('offline_images');
+    _offlineTravelRequestsBox =
+        await _openMapBox('offline_travel_requests');
+    _offlineUsersBox = await _openMapBox('offline_users');
+    // v2: legacy `route_points` had unknown typeId:100 (old adapter).
+    _routePointsBox = await _openMapBox('route_points_v2');
+    _trackingEventsBox = await _openMapBox('tracking_events');
+    _trackingCoverageCacheBox =
+        await _openMapBox('tracking_coverage_cache');
+    _matchedRouteCacheBox =
+        await _openMapBox('matched_route_cache');
+    _alignedRouteCacheBox =
+        await _openMapBox('aligned_route_cache');
+    _sessionBox = await _openMapBox('app_session');
+
+    // Best-effort cleanup of the corrupt legacy box (ignore failures).
+    unawaited(_discardLegacyBox('route_points'));
+  }
+
+  /// Opens a Map box; recovers from corrupt / unknown-typeId Hive files.
+  Future<Box<Map>> _openMapBox(String name) async {
     try {
-      await Hive.initFlutter();
-
-      // Register adapters if needed
-      // Hive.registerAdapter(SomeAdapter());
-
-      // Open boxes with error handling
-      _syncQueueBox = await Hive.openBox<Map>('sync_queue');
-      _offlineImagesBox = await Hive.openBox<Map>('offline_images');
-      _offlineTravelRequestsBox =
-          await Hive.openBox<Map>('offline_travel_requests');
-      _offlineUsersBox = await Hive.openBox<Map>('offline_users');
-      _routePointsBox = await Hive.openBox<Map>('route_points');
-      _trackingEventsBox = await Hive.openBox<Map>('tracking_events');
-      _trackingCoverageCacheBox =
-          await Hive.openBox<Map>('tracking_coverage_cache');
-      _matchedRouteCacheBox =
-          await Hive.openBox<Map>('matched_route_cache');
-      _alignedRouteCacheBox =
-          await Hive.openBox<Map>('aligned_route_cache');
-      _sessionBox = await Hive.openBox<Map>('app_session');
-
-    } catch (e) {
-      rethrow;
+      return await Hive.openBox<Map>(name);
+    } catch (_) {
+      await _discardLegacyBox(name);
+      try {
+        return await Hive.openBox<Map>(name);
+      } catch (_) {
+        final fallback = '${name}_fresh';
+        await _discardLegacyBox(fallback);
+        return Hive.openBox<Map>(fallback);
+      }
     }
+  }
+
+  Future<void> _discardLegacyBox(String name) async {
+    try {
+      if (Hive.isBoxOpen(name)) {
+        await Hive.box(name).close();
+      }
+    } catch (_) {}
+    try {
+      await Hive.deleteBoxFromDisk(name);
+    } catch (_) {}
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      await deleteHiveFileIfExists('${dir.path}/$name.hive');
+      await deleteHiveFileIfExists('${dir.path}/$name.lock');
+    } catch (_) {}
   }
 
   /// Close all boxes
@@ -317,6 +349,14 @@ class HiveDatabase {
 
   Future<List<Map>> getAllOfflineTravelRequests() async {
     return _offlineTravelRequestsBox?.values.toList() ?? [];
+  }
+
+  /// O(1) local lookup by Hive key (`requestId`).
+  Future<Map<String, dynamic>?> getOfflineTravelRequestById(String requestId) async {
+    if (requestId.isEmpty) return null;
+    final raw = _offlineTravelRequestsBox?.get(requestId);
+    if (raw is! Map) return null;
+    return Map<String, dynamic>.from(raw);
   }
 
   Future<void> updateTravelRequest(

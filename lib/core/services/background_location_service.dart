@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
-import 'package:location/location.dart' as loc;
+import 'package:geolocator/geolocator.dart';
 import 'package:uuid/uuid.dart';
 
 import '../constants/app_constants.dart';
@@ -28,9 +28,16 @@ enum TrackingPace {
 }
 
 /// Continuous GPS for live trip path; persists to Hive.
+///
+/// Runs on `geolocator` (not the `location` package). On iOS, CLLocationManager
+/// defaults `pausesLocationUpdatesAutomatically` to `true` with no way to
+/// override it from the `location` plugin — the OS would silently freeze the
+/// trail after the app sat in the background for a while (classic cause of
+/// "route never painted" reports on iOS). `geolocator`'s `AppleSettings`
+/// exposes that flag directly, so we disable it and tag the session as
+/// automotive navigation so iOS keeps sampling.
 class BackgroundLocationService {
-  final loc.Location _location = loc.Location();
-  StreamSubscription<loc.LocationData>? _subscription;
+  StreamSubscription<Position>? _subscription;
 
   String? _requestId;
   String? _legId;
@@ -39,10 +46,10 @@ class BackgroundLocationService {
 
   final KalmanFilter2D _kalmanFilter = KalmanFilter2D();
 
-  loc.LocationData? _lastAccepted;
+  Position? _lastAccepted;
   DateTime? _lastEmitTime;
   String? _lastPointId;
-  loc.LocationData? _prevAccepted;
+  Position? _prevAccepted;
   DateTime? _prevEmitTime;
   String? _prevPointId;
   final ValueNotifier<int> pointsBuffered = ValueNotifier<int>(0);
@@ -52,14 +59,13 @@ class BackgroundLocationService {
   String? get activeSessionId => _sessionId;
   bool get isRunning => _subscription != null;
 
-  /// Last good fix from the live stream (used when [Location.getLocation] stalls).
-  loc.LocationData? recentTrackerFix({
+  /// Last good fix from the live stream (used when a one-shot GPS read stalls).
+  Position? recentTrackerFix({
     Duration maxAge = const Duration(minutes: 45),
   }) {
     final last = _lastAccepted;
     final t = _lastEmitTime;
     if (last == null || t == null) return null;
-    if (last.latitude == null || last.longitude == null) return null;
     if (DateTime.now().difference(t) > maxAge) return null;
     return last;
   }
@@ -76,9 +82,9 @@ class BackgroundLocationService {
   }) async {
     if (!AppConstants.featureLiveGpsTracking) return;
 
-    final permission = await _location.hasPermission();
-    if (permission != loc.PermissionStatus.granted &&
-        permission != loc.PermissionStatus.grantedLimited) {
+    final permission = await Geolocator.checkPermission();
+    if (permission != LocationPermission.always &&
+        permission != LocationPermission.whileInUse) {
       return;
     }
 
@@ -103,15 +109,6 @@ class BackgroundLocationService {
       await _seedLastAcceptedFromHive(requestId);
     }
 
-    await _applySettings(_pace);
-    try {
-      final bgOk = await _location.enableBackgroundMode(enable: true);
-      if (bgOk != true) {
-        // Still track in foreground; background may be denied on some devices.
-      }
-    } catch (e) {
-    }
-
     if (ServiceLocator.I.has<WebSocketTrackingService>()) {
       final ws = ServiceLocator.I.get<WebSocketTrackingService>();
       if (!ws.isConnected) {
@@ -119,18 +116,16 @@ class BackgroundLocationService {
       }
     }
 
-    await _subscription?.cancel();
-    _subscription = _location.onLocationChanged.listen(
-      _onLocation,
-      onError: (_) {},
-    );
+    await _restartStream(_pace);
   }
 
   Future<void> setPace(TrackingPace pace) async {
     if (!AppConstants.featureLiveGpsTracking) return;
     if (_pace == pace) return;
     _pace = pace;
-    await _applySettings(_pace);
+    if (_subscription != null) {
+      await _restartStream(pace);
+    }
   }
 
   Future<void> setActiveLeg(String legId) async {
@@ -140,7 +135,7 @@ class BackgroundLocationService {
   /// Inserts a marker point (meeting start/end) with current fix.
   Future<void> recordStopMarker({
     required bool isStopMarker,
-    required loc.LocationData data,
+    required Position data,
   }) async {
     if (!AppConstants.featureLiveGpsTracking) return;
     if (_requestId == null || _legId == null || _sessionId == null) return;
@@ -155,14 +150,6 @@ class BackgroundLocationService {
     await _subscription?.cancel();
     _subscription = null;
     _kalmanFilter.reset();
-    // On some devices this never completes and blocks the UI thread of punch flow.
-    try {
-      await _location
-          .enableBackgroundMode(enable: false)
-          .timeout(const Duration(seconds: 5));
-    } catch (_) {
-      // Ignore: stream is already stopped; app can still finish the punch.
-    }
     _requestId = null;
     _legId = null;
     _sessionId = null;
@@ -175,11 +162,59 @@ class BackgroundLocationService {
     pointsBuffered.value = 0;
   }
 
-  Future<void> _applySettings(TrackingPace pace) async {
-    await _location.changeSettings(
-      accuracy: loc.LocationAccuracy.high,
-      interval: pace == TrackingPace.traveling ? 5000 : 25000,
-      distanceFilter: pace == TrackingPace.traveling ? 8 : 35,
+  /// geolocator's stream settings are immutable once the stream starts —
+  /// pace changes cancel and re-subscribe rather than mutating a live stream.
+  Future<void> _restartStream(TrackingPace pace) async {
+    await _subscription?.cancel();
+    _subscription = Geolocator.getPositionStream(
+      locationSettings: _buildLocationSettings(pace),
+    ).listen(_onLocation, onError: (_) {});
+  }
+
+  LocationSettings _buildLocationSettings(TrackingPace pace) {
+    final distanceFilter = pace == TrackingPace.traveling ? 8 : 35;
+    final interval = pace == TrackingPace.traveling
+        ? const Duration(seconds: 5)
+        : const Duration(seconds: 25);
+
+    if (kIsWeb) {
+      return LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: distanceFilter,
+      );
+    }
+
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      return AppleSettings(
+        accuracy: LocationAccuracy.high,
+        activityType: ActivityType.automotiveNavigation,
+        distanceFilter: distanceFilter,
+        // Never let iOS silently freeze the GPS trail mid-trip to save
+        // battery — this was the root cause of gaps after backgrounding.
+        pauseLocationUpdatesAutomatically: false,
+        showBackgroundLocationIndicator: true,
+        allowBackgroundLocationUpdates: true,
+      );
+    }
+
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return AndroidSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: distanceFilter,
+        intervalDuration: interval,
+        foregroundNotificationConfig: const ForegroundNotificationConfig(
+          notificationTitle: 'Trip Track',
+          notificationText: 'Tracking your trip location',
+          notificationChannelName: 'Live Trip Tracking',
+          enableWakeLock: true,
+          setOngoing: true,
+        ),
+      );
+    }
+
+    return LocationSettings(
+      accuracy: LocationAccuracy.high,
+      distanceFilter: distanceFilter,
     );
   }
 
@@ -202,13 +237,18 @@ class BackgroundLocationService {
         );
         if (!decision.accepted) continue;
         final ts = GpsGapRoadFill.parseTimestamp(rows[i]['timestamp']);
-        _lastAccepted = loc.LocationData.fromMap({
-          'latitude': lat,
-          'longitude': lng,
-          'accuracy': acc,
-          'speed': (rows[i]['speed'] as num?)?.toDouble() ?? 0,
-          'heading': (rows[i]['heading'] as num?)?.toDouble() ?? 0,
-        });
+        _lastAccepted = Position(
+          latitude: lat,
+          longitude: lng,
+          timestamp: ts ?? DateTime.now(),
+          accuracy: acc,
+          altitude: 0,
+          altitudeAccuracy: 0,
+          heading: (rows[i]['heading'] as num?)?.toDouble() ?? 0,
+          headingAccuracy: 0,
+          speed: (rows[i]['speed'] as num?)?.toDouble() ?? 0,
+          speedAccuracy: 0,
+        );
         // Must use Hive timestamp — DateTime.now() made kill gaps look like 0s.
         _lastEmitTime = ts ?? DateTime.now();
         return;
@@ -217,15 +257,18 @@ class BackgroundLocationService {
     }
   }
 
-  Future<void> _onLocation(loc.LocationData data) async {
+  Future<void> _onLocation(Position data) async {
     if (_requestId == null || _legId == null || _sessionId == null) return;
     if (!AppConstants.featureLiveGpsTracking) return;
+    // Fake-GPS apps report `isMocked: true` — never let a spoofed trail
+    // corrupt the trip route or feed a false arrival/departure geofence.
+    if (data.isMocked) return;
 
     final lat = data.latitude;
     final lng = data.longitude;
-    if (lat == null || lng == null) return;
+    if (!GeoUtils.isValidLatLng(lat, lng)) return;
 
-    final acc = data.accuracy ?? 10.0;
+    final acc = data.accuracy;
     if (acc > _maxAccuracyM) return;
 
     final now = DateTime.now();
@@ -263,7 +306,7 @@ class BackgroundLocationService {
         ? <String, double>{
             'latitude': lat,
             'longitude': lng,
-            'speedMps': rawSpeed ?? 0.0,
+            'speedMps': rawSpeed,
           }
         : _kalmanFilter.process(
             latitude: lat,
@@ -274,7 +317,7 @@ class BackgroundLocationService {
 
     final filteredLat = filteredResult['latitude']!;
     final filteredLng = filteredResult['longitude']!;
-    final estimatedSpeed = filteredResult['speedMps'] ?? data.speed ?? 0.0;
+    final estimatedSpeed = filteredResult['speedMps'] ?? data.speed;
 
     // Re-check filtered coords against last accepted (Kalman can lag toward jump).
     // Skip re-gate on gap_resume — we already accepted the raw hop.
@@ -295,25 +338,27 @@ class BackgroundLocationService {
       }
     }
 
-    final filteredData = loc.LocationData.fromMap({
-      'latitude': filteredLat,
-      'longitude': filteredLng,
-      'accuracy': acc,
-      'altitude': data.altitude,
-      'speed': estimatedSpeed,
-      'speed_accuracy': data.speedAccuracy,
-      'heading': data.heading,
-      'time': data.time,
-      'isMock': data.isMock,
-    });
+    final filteredData = Position(
+      latitude: filteredLat,
+      longitude: filteredLng,
+      timestamp: now,
+      accuracy: acc,
+      altitude: data.altitude,
+      altitudeAccuracy: data.altitudeAccuracy,
+      speed: estimatedSpeed,
+      speedAccuracy: data.speedAccuracy,
+      heading: data.heading,
+      headingAccuracy: data.headingAccuracy,
+      isMocked: data.isMocked,
+    );
 
-    if (last != null && last.latitude != null && last.longitude != null) {
+    if (last != null) {
       final lastEmit = _lastEmitTime ?? now;
       final dt = now.difference(lastEmit);
       if (dt.inMilliseconds < _minRepeatMs) {
         final d = _haversineM(
-          last.latitude!,
-          last.longitude!,
+          last.latitude,
+          last.longitude,
           filteredLat,
           filteredLng,
         );
@@ -322,8 +367,8 @@ class BackgroundLocationService {
       // Paused / indoor: require larger movement before storing.
       if (_pace == TrackingPace.paused &&
           _haversineM(
-                last.latitude!,
-                last.longitude!,
+                last.latitude,
+                last.longitude,
                 filteredLat,
                 filteredLng,
               ) <
@@ -332,10 +377,8 @@ class BackgroundLocationService {
       }
     }
 
-    final speed = filteredData.speed;
-    final moving = speed == null
-        ? true
-        : speed.abs() > 0.4 || _pace == TrackingPace.traveling;
+    final moving =
+        filteredData.speed.abs() > 0.4 || _pace == TrackingPace.traveling;
 
     // Capture previous fix before we overwrite — used for road gap-fill.
     final gapFrom = last;
@@ -355,17 +398,13 @@ class BackgroundLocationService {
     // Drop urban GPS V-spikes (A→off-road B→near A) as soon as C arrives.
     if (!isGapResume &&
         spikeAnchor != null &&
-        spikeAnchor.latitude != null &&
-        spikeAnchor.longitude != null &&
         gapFrom != null &&
-        gapFrom.latitude != null &&
-        gapFrom.longitude != null &&
         spikeMidId != null &&
         _isUrbanSpike(
-          aLat: spikeAnchor.latitude!,
-          aLng: spikeAnchor.longitude!,
-          bLat: gapFrom.latitude!,
-          bLng: gapFrom.longitude!,
+          aLat: spikeAnchor.latitude,
+          aLng: spikeAnchor.longitude,
+          bLat: gapFrom.latitude,
+          bLng: gapFrom.longitude,
           cLat: filteredLat,
           cLng: filteredLng,
         )) {
@@ -386,14 +425,11 @@ class BackgroundLocationService {
     // Road-fill B→C after kill / GPS loss. Do not require gap_resume alone —
     // soft gaps (60s/400m) and sub-2.5km kill hops must fill too. Never await
     // Directions here (it stalled the GPS stream).
-    if (gapFrom != null &&
-        gapFrom.latitude != null &&
-        gapFrom.longitude != null &&
-        gapFromTime != null) {
+    if (gapFrom != null && gapFromTime != null) {
       final timeDiff = now.difference(gapFromTime);
       final dist = GeoUtils.distanceMeters(
-        gapFrom.latitude!,
-        gapFrom.longitude!,
+        gapFrom.latitude,
+        gapFrom.longitude,
         filteredLat,
         filteredLng,
       );
@@ -403,8 +439,8 @@ class BackgroundLocationService {
       )) {
         unawaited(
           _persistRoadFillForGap(
-            fromLat: gapFrom.latitude!,
-            fromLng: gapFrom.longitude!,
+            fromLat: gapFrom.latitude,
+            fromLng: gapFrom.longitude,
             fromTime: gapFromTime,
             toLat: filteredLat,
             toLng: filteredLng,
@@ -534,7 +570,7 @@ class BackgroundLocationService {
   }
 
   Future<({bool synced, String pointId})?> _persistPoint(
-    loc.LocationData data, {
+    Position data, {
     required bool isMoving,
     required bool isStopMarker,
     String source = 'gps',
@@ -542,7 +578,7 @@ class BackgroundLocationService {
   }) async {
     final lat = data.latitude;
     final lng = data.longitude;
-    if (lat == null || lng == null) return null;
+    if (!GeoUtils.isValidLatLng(lat, lng)) return null;
     final pointId = const Uuid().v4();
     final ts = timestamp ?? DateTime.now();
 

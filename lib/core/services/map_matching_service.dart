@@ -171,12 +171,13 @@ class MapMatchingService {
 
   /// Fetch match (cache→network) and merge into [request].
   Future<TravelRequestModel> enhanceWithOfficialMatch(
-    TravelRequestModel request,
-  ) async {
+    TravelRequestModel request, {
+    bool preferNetwork = false,
+  }) async {
     final id = request.restResourceId.isNotEmpty
         ? request.restResourceId
         : request.requestId;
-    final match = await fetchMatchedRoute(id);
+    final match = await fetchMatchedRoute(id, preferNetwork: preferNetwork);
     if (match == null || (!match.isReady && match.legs.isEmpty)) {
       return request;
     }

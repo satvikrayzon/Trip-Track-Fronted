@@ -1,65 +1,44 @@
 import 'dart:async';
 
-import 'dart:io';
 import 'package:flutter/foundation.dart';
 
-
-
 import '../../../../core/app_messenger.dart';
-
 import '../../../../core/di/service_locator.dart';
-
 import '../../../../core/network/failures/network_failure.dart';
 import '../../../../core/network/models/api_result.dart';
-
 import '../../../../core/theme/app_colors.dart';
-
 import '../../../auth/data/datasources/users_remote_datasource.dart';
-
 import '../../../travel/data/datasources/travel_request_remote_datasource.dart';
-
 import '../../../travel/data/models/travel_request_model.dart';
 import '../../../travel/services/travel_request_delete_service.dart';
 import '../../../travel/utils/travel_request_delete_utils.dart';
 import '../../../../features/tracking/data/services/trip_realtime_binder.dart';
 import '../../../../core/widgets/trip_route_map_data.dart';
-import '../../../../core/services/trip_road_metrics_service.dart';
-
-
 
 class AdminTravelRequestsController {
-
   AdminTravelRequestsController({
     TravelRequestRemoteDataSource? travelApi,
     UsersRemoteDataSource? usersApi,
   })  : _travelApi = travelApi ?? ServiceLocator.I.get(),
         _usersApi = usersApi ?? ServiceLocator.I.get();
 
-
+  static const int _pageSize = 50;
+  static const int _maxPages = 100;
 
   final TravelRequestRemoteDataSource _travelApi;
-
   final UsersRemoteDataSource _usersApi;
 
-
-
   final ValueNotifier<bool> isLoading = ValueNotifier<bool>(false);
-
   final ValueNotifier<List<TravelRequestModel>> requests =
-
       ValueNotifier<List<TravelRequestModel>>([]);
-
   final ValueNotifier<String> searchQuery = ValueNotifier<String>('');
-
   final ValueNotifier<String> filterStatus = ValueNotifier<String>('all');
   final ValueNotifier<String?> deletingRequestId = ValueNotifier<String?>(null);
-  
   final ValueNotifier<DateTime?> startDate = ValueNotifier<DateTime?>(null);
   final ValueNotifier<DateTime?> endDate = ValueNotifier<DateTime?>(null);
   final ValueNotifier<String?> selectedUserId = ValueNotifier<String?>(null);
 
   List<TravelRequestModel> _allRequests = [];
-
   Timer? _pollTimer;
   TripRealtimeBinder? _tripRealtime;
 
@@ -81,9 +60,7 @@ class AdminTravelRequestsController {
     _tripRealtime?.dispose();
     _tripRealtime = null;
     isLoading.dispose();
-
     requests.dispose();
-
     searchQuery.dispose();
     filterStatus.dispose();
     deletingRequestId.dispose();
@@ -92,39 +69,45 @@ class AdminTravelRequestsController {
     selectedUserId.dispose();
   }
 
-
-
   Future<void> loadRequests({bool silent = false}) async {
-
     try {
-
       if (!silent) {
         isLoading.value = true;
       }
 
-
-
       final fetchedItems = <TravelRequestModel>[];
+      final seenIds = <String>{};
       int page = 1;
       bool hasMore = true;
 
-      while (hasMore) {
+      while (hasMore && page <= _maxPages) {
         final result = await _travelApi.listTravelRequests(
           page: page,
-          limit: 50,
+          limit: _pageSize,
           mine: false,
         );
 
         switch (result) {
           case ApiSuccess(:final data):
+            var added = 0;
             for (final m in data.items) {
               try {
                 final req = TravelRequestModel.fromMap(m);
+                final key = req.restResourceId.isNotEmpty
+                    ? req.restResourceId
+                    : (req.requestId.isNotEmpty
+                        ? req.requestId
+                        : req.tripId);
+                if (key.isNotEmpty && !seenIds.add(key)) continue;
                 fetchedItems.add(req);
-              } catch (e) {
-              }
+                added++;
+              } catch (_) {}
             }
-            if (data.items.length < 50 || !data.hasMore) {
+            // Stop if API re-sends the same page / raw full list, or no more pages.
+            if (added == 0 ||
+                data.items.isEmpty ||
+                data.items.length < _pageSize ||
+                !data.hasMore) {
               hasMore = false;
             } else {
               page++;
@@ -133,7 +116,6 @@ class AdminTravelRequestsController {
             hasMore = false;
         }
       }
-
 
       if (fetchedItems.isNotEmpty) {
         // Keep richer in-memory card fields when list API omits them.
@@ -159,55 +141,47 @@ class AdminTravelRequestsController {
         }).toList();
         _allRequests.sort((a, b) => b.requestDate.compareTo(a.requestDate));
 
-          // `/travel-requests` may omit `user.name` / `user.employeeCode` for
-          // some backend versions. Enrich from `/users` so the admin/manager UI
-          // can always show identity fields.
-          try {
-            final usersRes = await _usersApi.listUsers();
-            switch (usersRes) {
-              case ApiSuccess(:final data):
-                final userByUid = {for (final u in data) u.uid: u};
-                _allRequests = _allRequests.map((r) {
-                  final u = userByUid[r.userId];
-                  if (u == null) return r;
-                  final nameMissing = r.userName.trim().isEmpty;
-                  final codeMissing = (r.employeeCode ?? '').trim().isEmpty;
-                  if (!nameMissing && !codeMissing) return r;
-                  return r.copyWith(
-                    userName: nameMissing ? u.name : r.userName,
-                    employeeCode: codeMissing ? u.employeeCode : r.employeeCode,
-                  );
-                }).toList();
-              case ApiFailure():
-            }
-          } catch (e, st) {
+        // `/travel-requests` may omit `user.name` / `user.employeeCode` for
+        // some backend versions. Enrich from `/users` so the admin/manager UI
+        // can always show identity fields.
+        try {
+          final usersRes = await _usersApi.listUsers();
+          switch (usersRes) {
+            case ApiSuccess(:final data):
+              final userByUid = {for (final u in data) u.uid: u};
+              _allRequests = _allRequests.map((r) {
+                final u = userByUid[r.userId];
+                if (u == null) return r;
+                final nameMissing = r.userName.trim().isEmpty;
+                final codeMissing = (r.employeeCode ?? '').trim().isEmpty;
+                if (!nameMissing && !codeMissing) return r;
+                return r.copyWith(
+                  userName: nameMissing ? u.name : r.userName,
+                  employeeCode: codeMissing ? u.employeeCode : r.employeeCode,
+                );
+              }).toList();
+            case ApiFailure():
           }
+        } catch (_) {}
 
+        // List shows API/summary fields only — no per-trip GPS trail fetch.
+        // Full track enhance belongs on detail / export, not on listing.
         _applyFilters();
-        // Full reload: sync from GPS trail and PATCH so admin matches user.
-        // Silent poll skips enhance (merge keeps higher in-memory km).
-        if (!silent) {
-          await _enhanceMetrics();
-        }
       } else {
         _allRequests = [];
         requests.value = [];
       }
-
-    } catch (e, st) {
+    } catch (_) {
       // Do not clear _allRequests completely on unexpected errors if we already fetched them!
       // But if it failed BEFORE fetching, we must show empty.
       if (_allRequests.isEmpty) {
         requests.value = [];
       }
     } finally {
-
       if (!silent) {
         isLoading.value = false;
       }
-
     }
-
   }
 
 
@@ -296,31 +270,9 @@ class AdminTravelRequestsController {
 
 
 
-  Future<void> refresh() => loadRequests();
+  Future<void> refresh({bool silent = false}) => loadRequests(silent: silent);
 
 
-
-  Future<void> _enhanceMetrics() async {
-    if (!ServiceLocator.I.has<TripRoadMetricsService>()) return;
-    // Sync all loaded trips (not just first 20) so the open trip is not skipped.
-    final targets = List<TravelRequestModel>.from(_allRequests);
-    if (targets.isEmpty) return;
-    try {
-      final enhanced = await ServiceLocator.I
-          .get<TripRoadMetricsService>()
-          .enhanceAll(targets, persist: true, syncFromTrack: true);
-      final byId = <String, TravelRequestModel>{
-        for (final r in enhanced)
-          if (r.requestId.isNotEmpty) r.requestId: r,
-      };
-      _allRequests = _allRequests.map((r) {
-        final e = byId[r.requestId];
-        return e ?? r;
-      }).toList();
-      _applyFilters();
-    } catch (e) {
-    }
-  }
 
   void applyTripUpdate(TravelRequestModel updatedRequest) {
     final normalized = updatedRequest

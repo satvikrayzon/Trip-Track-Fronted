@@ -46,11 +46,14 @@ class TripRoadMetricsService {
   ///
   /// [force] recomputes even when locked.
   /// [syncFromTrack] refreshes completed-leg km from route points (admin/list).
+  /// [preferLocalTrail] skips API route-points when Hive already has samples
+  /// (user details / offline-first).
   Future<TravelRequestModel> enhance(
     TravelRequestModel current, {
     bool persist = true,
     bool force = false,
     bool syncFromTrack = false,
+    bool preferLocalTrail = false,
   }) async {
     if (!_needsEnhance(
       current,
@@ -60,7 +63,10 @@ class TripRoadMetricsService {
       return current.sanitizeAbsurdOfficialDistances().withRecalculatedSummary();
     }
 
-    final allPoints = await _loadAllRoutePoints(current);
+    final allPoints = await _loadAllRoutePoints(
+      current,
+      preferLocal: preferLocalTrail && !syncFromTrack,
+    );
     var updatedLegs = <TripLegModel>[];
     var changed = false;
 
@@ -268,8 +274,9 @@ class TripRoadMetricsService {
   }
 
   Future<List<RoutePointModel>> _loadAllRoutePoints(
-    TravelRequestModel current,
-  ) async {
+    TravelRequestModel current, {
+    bool preferLocal = false,
+  }) async {
     final pointsRaw = await _hive.getRoutePointsForRequest(current.requestId);
     var allPoints = pointsRaw.map(RoutePointModel.fromMap).toList();
 
@@ -277,8 +284,13 @@ class TripRoadMetricsService {
       allPoints = current.routePoints.map(RoutePointModel.fromMap).toList();
     }
 
+    // User/offline path: trust local trail when present.
+    if (preferLocal && allPoints.isNotEmpty) {
+      return allPoints;
+    }
+
     final api = _api;
-    // Always prefer server trail for admin/list sync (user device Hive may be empty).
+    // Prefer server trail for admin/list sync (user device Hive may be empty).
     if (api != null && current.restResourceId.isNotEmpty) {
       try {
         final res = await api.listRoutePoints(current.restResourceId);

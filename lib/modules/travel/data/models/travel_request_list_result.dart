@@ -26,6 +26,8 @@ class TravelRequestListResult {
     required int limit,
   }) {
     if (data is List) {
+      // Plain arrays are a full payload in one response — never page further
+      // (treating length >= limit as hasMore caused an infinite fetch loop).
       final items = data
           .whereType<Map>()
           .map((e) => Map<String, dynamic>.from(e))
@@ -35,7 +37,7 @@ class TravelRequestListResult {
         total: items.length,
         page: page,
         limit: limit,
-        hasMore: items.length >= limit,
+        hasMore: false,
       );
     }
 

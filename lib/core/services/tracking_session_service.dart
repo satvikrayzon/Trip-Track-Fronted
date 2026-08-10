@@ -1,4 +1,4 @@
-import 'package:location/location.dart' as loc;
+import 'package:geolocator/geolocator.dart';
 
 import '../constants/app_constants.dart';
 import '../di/service_locator.dart';
@@ -11,7 +11,6 @@ class TrackingSessionService {
       : _bg = background ?? ServiceLocator.I.get<BackgroundLocationService>();
 
   final BackgroundLocationService _bg;
-  final loc.Location _oneShot = loc.Location();
 
   Future<void> onTravelDeparture({
     required String requestId,
@@ -48,7 +47,15 @@ class TrackingSessionService {
   Future<void> recordMeetingStopMarker({required bool isStopMarker}) async {
     if (!AppConstants.featureLiveGpsTracking) return;
     if (!_bg.isRunning) return;
-    final data = await _oneShot.getLocation();
+    // Prefer the live tracker's own recent fix (already Kalman-filtered) —
+    // fall back to a fresh one-shot read only if the stream is momentarily dry.
+    final data = _bg.recentTrackerFix(maxAge: const Duration(seconds: 30)) ??
+        await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            timeLimit: Duration(seconds: 8),
+          ),
+        );
     await _bg.recordStopMarker(isStopMarker: isStopMarker, data: data);
   }
 
