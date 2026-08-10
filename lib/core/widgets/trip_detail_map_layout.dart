@@ -22,7 +22,6 @@ import '../services/gps_gap_road_fill.dart';
 import '../di/service_locator.dart';
 import '../utils/distance_sanity.dart';
 import '../utils/geo_utils.dart';
-import '../utils/route_point_simplify.dart';
 import '../../modules/travel/data/models/route_segment_model.dart';
 
 /// Zomato / Swiggy / Uber style trip detail: full-screen map + draggable sheet.
@@ -788,7 +787,13 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
         paths.any((leg) => leg.any((s) => s.length >= 2));
     final showGpsLayer = gpsHasPath || _isLiveTrip || isCompleted;
     final showMatchedLayer = hasMatched && !gpsHasPath && !isCompleted;
-    const edgeMax = kAlignedMapMaxEdgeMeters;
+    // `paths` here has already been through the full gap-fill → snap →
+    // corridor → stitch pipeline (see RoadAlignedRouteService.align). Re-
+    // breaking it at a tight 400-900m threshold would undo that work and
+    // paint visible holes for gaps that were already bridged with real road
+    // geometry — or with a straight fallback when Directions had nothing.
+    // Only break on genuine teleports (wrong-country jumps).
+    const edgeMax = GpsGapRoadFill.maxStraightLineMeters;
     if (showGpsLayer && paths != null) {
       for (var i = 0; i < paths.length; i++) {
         final color = _legTrailColor(i);
@@ -796,6 +801,7 @@ class _TripDetailMapLayoutState extends State<TripDetailMapLayout>
           final pieces = mapDisplayRouteSegments(
             paths[i][s],
             maxEdgeMeters: edgeMax,
+            maxJumpMeters: edgeMax,
           );
           for (var p = 0; p < pieces.length; p++) {
             final display = pieces[p];

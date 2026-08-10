@@ -6,7 +6,6 @@ import 'package:google_maps_flutter/google_maps_flutter.dart';
 import '../utils/google_map_controller_utils.dart';
 import '../utils/geo_utils.dart';
 import '../utils/map_marker_icon.dart';
-import '../utils/route_point_simplify.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_text_styles.dart';
 import '../../modules/travel/data/models/travel_request_model.dart';
@@ -364,9 +363,11 @@ class _TripRouteFullscreenMapScreenState
           for (var i = 0; i < colored.length; i++) {
             final piece = colored[i];
             if (piece.points.length < 2) continue;
+            // Already gap-filled/stitched — only break on true teleports.
             final pieces = mapDisplayRouteSegments(
               piece.points,
-              maxEdgeMeters: kAlignedMapMaxEdgeMeters,
+              maxEdgeMeters: GpsGapRoadFill.maxStraightLineMeters,
+              maxJumpMeters: GpsGapRoadFill.maxStraightLineMeters,
             );
             for (var p = 0; p < pieces.length; p++) {
               final display = pieces[p];
@@ -393,7 +394,8 @@ class _TripRouteFullscreenMapScreenState
           for (var s = 0; s < _legPaths[i].length; s++) {
             final pieces = mapDisplayRouteSegments(
               _legPaths[i][s],
-              maxEdgeMeters: kAlignedMapMaxEdgeMeters,
+              maxEdgeMeters: GpsGapRoadFill.maxStraightLineMeters,
+              maxJumpMeters: GpsGapRoadFill.maxStraightLineMeters,
             );
             for (var p = 0; p < pieces.length; p++) {
               final display = pieces[p];
@@ -425,7 +427,8 @@ class _TripRouteFullscreenMapScreenState
       for (var s = 0; s < _legPaths[legIndex].length; s++) {
         final pieces = mapDisplayRouteSegments(
           _legPaths[legIndex][s],
-          maxEdgeMeters: kAlignedMapMaxEdgeMeters,
+          maxEdgeMeters: GpsGapRoadFill.maxStraightLineMeters,
+          maxJumpMeters: GpsGapRoadFill.maxStraightLineMeters,
         );
         for (var p = 0; p < pieces.length; p++) {
           final pts = pieces[p];

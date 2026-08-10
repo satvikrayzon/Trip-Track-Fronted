@@ -709,14 +709,26 @@ class RoadAlignedRouteService {
   }
 
   /// Split aligned path for map polylines (break only true teleports).
+  ///
+  /// By the time a route reaches here it has already been through the full
+  /// gap-fill → snap-to-roads → directions-corridor → stitch pipeline in
+  /// [align] — every real GPS-silence gap it was possible to bridge already
+  /// has road geometry painted into it. A long edge that *still* survives all
+  /// of that is either (a) a hop where Directions genuinely had no route
+  /// (offline / API miss) and we fell back to a straight connector, which
+  /// should still be drawn so the trip looks continuous like Google Maps, or
+  /// (b) a true teleport / wrong-country GPS error, which must never be
+  /// drawn. [GpsGapRoadFill.maxStraightLineMeters] is the line between those
+  /// two — anything shorter is a real (if imperfect) connection.
   List<List<LatLng>> toMapPieces(RoadAlignedRoute route) {
     if (route.points.length < 2) return const [];
-    final maxEdge =
-        route.isAligned ? kAlignedMapMaxEdgeMeters : kMapMaxEdgeMeters;
+    // Every engine that reaches here (snap, corridor, or the gps_cleaned
+    // fallback) already ran the same gap-fill + stitch pass in `align`, so
+    // they all get the same lenient teleport-only break threshold.
     return [
       for (final piece in breakLongMapEdges(
         simplifyRoutePointsForMap(route.points),
-        maxEdgeMeters: maxEdge,
+        maxEdgeMeters: GpsGapRoadFill.maxStraightLineMeters,
       ))
         if (piece.length >= 2) piece,
     ];

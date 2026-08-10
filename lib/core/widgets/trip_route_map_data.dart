@@ -973,8 +973,11 @@ void evictRoutePointsCache(String id) {
 List<List<LatLng>> mapDisplayRouteSegments(
   List<LatLng> points, {
   double maxEdgeMeters = kMapMaxEdgeMeters,
+  double maxJumpMeters = 800,
 }) {
-  final simplified = simplifyRoutePointsForMap(stripTeleportSpikesForMap(points));
+  final simplified = simplifyRoutePointsForMap(
+    stripTeleportSpikesForMap(points, maxJumpMeters: maxJumpMeters),
+  );
   return breakLongMapEdges(simplified, maxEdgeMeters: maxEdgeMeters);
 }
 
